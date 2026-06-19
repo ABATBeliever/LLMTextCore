@@ -1,0 +1,9 @@
+LIBRARY LLMTextCore
+EXPORTS
+    llmtc_version_info
+    llmtc_version_info_to_buffer
+    llmtc_set_verbose
+    llmtc_init
+    llmtc_generate
+    llmtc_generate_to_buffer
+    llmtc_free
