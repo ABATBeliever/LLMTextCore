@@ -9,10 +9,6 @@ HSPなどの言語からも呼び出せるよう設計しています。
 
 両方とも中身は同じロジックで、CLIはDLLを薄くラップしているだけです。
 
-**設計方針: ステートレス。** DLL側は会話履歴を一切保持しません。複数ターンの会話をしたい場合は、
-呼び出し側で過去のやり取りをプロンプトとして連結し、`llmtc_generate`系の呼び出しのたびに
-まるごと渡してください。
-
 ## ビルド手順 (Windows / Visual Studio)
 
 ```powershell
@@ -20,9 +16,7 @@ git clone https://github.com/ggml-org/llama.cpp
 cmake -B build -A x64
 cmake --build build --config Release
 ```
-
-成功すると `build\Release\LLMTextCore.dll` と `build\Release\LLMTextCore.exe` ができます。
-配布物は **この2ファイル + .ggufモデルファイル** だけで完結します。
+`build\Release\LLMTextCore.dll` と `build\Release\LLMTextCore.exe` ができます。
 
 ## CLIの使い方
 
