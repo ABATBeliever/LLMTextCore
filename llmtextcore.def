@@ -3,7 +3,11 @@ EXPORTS
     llmtc_version_info
     llmtc_version_info_to_buffer
     llmtc_set_verbose
+    llmtc_set_encoding
     llmtc_init
     llmtc_generate
     llmtc_generate_to_buffer
+    llmtc_generate_async
+    llmtc_get_status
+    llmtc_get_result_to_buffer
     llmtc_free
