@@ -28,14 +28,19 @@ static llama_context* g_ctx   = nullptr;
 
 static std::thread      g_worker_thread;
 static std::atomic<int> g_status{LLMTC_STATUS_IDLE};
-static std::mutex       g_result_mutex;
-static std::string      g_async_result;   // 非同期生成の結果 (常にUTF-8)
-static std::string      g_reply_buffer;   // do_generate 内での作業バッファ (常にUTF-8)
+
+static std::mutex  g_result_mutex;    // g_async_result の保護
+static std::string g_async_result;    // 生成完了後の最終テキスト (UTF-8)
+
+static std::mutex  g_partial_mutex;   // g_partial_buffer の保護
+static std::string g_partial_buffer;  // 生成中の途中テキスト (UTF-8、累積)
+
+static std::string g_reply_buffer;    // do_generate 内の作業用 (UTF-8)
 
 static int g_verbose  = 0;
 static int g_encoding = LLMTC_ENCODING_UTF8;
 
-// ----- エンコーディング変換ヘルパー (Windowsのみ) -----
+// ----- エンコーディング変換 -----
 
 #ifdef _WIN32
 static std::string convert_encoding(const std::string& src, UINT from_cp, UINT to_cp) {
@@ -51,20 +56,15 @@ static std::string convert_encoding(const std::string& src, UINT from_cp, UINT t
     if (!result.empty() && result.back() == '\0') result.pop_back();
     return result;
 }
-static std::string to_utf8(const std::string& s) {
-    return (g_encoding == LLMTC_ENCODING_SJIS) ? convert_encoding(s, CP_ACP, CP_UTF8) : s;
-}
 static std::string to_output(const std::string& s) {
     return (g_encoding == LLMTC_ENCODING_SJIS) ? convert_encoding(s, CP_UTF8, CP_ACP) : s;
 }
 #else
-static std::string to_utf8(const std::string& s)   { return s; }
 static std::string to_output(const std::string& s) { return s; }
 #endif
 
-// ----- ヘルパー -----
+// ----- バッファヘルパー -----
 
-// src(UTF-8 or 変換済み) を out_buffer にコピーする。変換は呼び出し前に済ませること。
 static int copy_to_buffer(const char* src, char* out_buffer, int buffer_size) {
     if (!out_buffer || buffer_size <= 0) return -1;
     if (!src) { out_buffer[0] = '\0'; return -2; }
@@ -75,11 +75,12 @@ static int copy_to_buffer(const char* src, char* out_buffer, int buffer_size) {
     return (int)copy_len;
 }
 
-// 内部UTF-8文字列をエンコーディング変換してバッファに書き込む。
 static int copy_to_buffer_encoded(const std::string& utf8_src, char* out_buffer, int buffer_size) {
     std::string converted = to_output(utf8_src);
     return copy_to_buffer(converted.c_str(), out_buffer, buffer_size);
 }
+
+// ----- ログ -----
 
 static void llmtc_log_callback(ggml_log_level level, const char* text, void* user_data) {
     (void)user_data;
@@ -88,11 +89,17 @@ static void llmtc_log_callback(ggml_log_level level, const char* text, void* use
     }
 }
 
-// ----- 生成処理本体 (内部は常にUTF-8) -----
+// ----- 生成処理本体 -----
 
+// 入力は常にUTF-8。生成したトークンは g_reply_buffer と g_partial_buffer に累積する。
 static bool do_generate(const char* system_prompt_utf8, const char* user_message_utf8,
                          double temperature, int max_tokens) {
     g_reply_buffer.clear();
+    {
+        std::lock_guard<std::mutex> lk(g_partial_mutex);
+        g_partial_buffer.clear();
+    }
+
     if (!g_ctx || !g_model || !user_message_utf8) return false;
 
     float temp    = (temperature > 0.0) ? (float)temperature : 0.7f;
@@ -131,8 +138,8 @@ static bool do_generate(const char* system_prompt_utf8, const char* user_message
     llama_sampler_chain_add(sampler, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
 
     llama_batch batch = llama_batch_get_one(tokens.data(), (int32_t)tokens.size());
-    int n_generated = 0;
-    bool success = true;
+    int  n_generated = 0;
+    bool success     = true;
 
     while (true) {
         if (llama_decode(g_ctx, batch) != 0) { success = false; break; }
@@ -142,7 +149,12 @@ static bool do_generate(const char* system_prompt_utf8, const char* user_message
 
         char piece[256];
         int len = llama_token_to_piece(vocab, new_token, piece, sizeof(piece), 0, true);
-        if (len > 0) g_reply_buffer.append(piece, len);
+        if (len > 0) {
+            g_reply_buffer.append(piece, len);
+            // ストリーミング用: partial_buffer をリアルタイムで更新する
+            std::lock_guard<std::mutex> lk(g_partial_mutex);
+            g_partial_buffer.append(piece, len);
+        }
 
         llama_token next_input = new_token;
         batch = llama_batch_get_one(&next_input, 1);
@@ -197,11 +209,48 @@ int LLMTC_CALL llmtc_init(const char* model_path, int n_ctx, int n_gpu_layers) {
     return 0;
 }
 
+void LLMTC_CALL llmtc_free(void) {
+    if (g_worker_thread.joinable()) g_worker_thread.join();
+    if (g_ctx)   { llama_free(g_ctx);        g_ctx = nullptr; }
+    if (g_model) { llama_model_free(g_model); g_model = nullptr; }
+    llama_backend_free();
+    g_reply_buffer.clear();
+    g_async_result.clear();
+    {
+        std::lock_guard<std::mutex> lk(g_partial_mutex);
+        g_partial_buffer.clear();
+    }
+    g_status.store(LLMTC_STATUS_IDLE);
+}
+
+// ---- モデル情報 ----
+
+int LLMTC_CALL llmtc_get_model_info_to_buffer(char* out_buffer, int buffer_size) {
+    if (!g_model || !g_ctx) return copy_to_buffer("(not loaded)", out_buffer, buffer_size);
+
+    char name_buf[256] = "(unknown)";
+    llama_model_desc(g_model, name_buf, sizeof(name_buf));
+
+    uint64_t params = llama_model_n_params(g_model);
+    int      n_ctx  = (int)llama_n_ctx(g_ctx);
+
+    char info[512];
+    snprintf(info, sizeof(info),
+        "name: %s\nparams: %llu\nn_ctx: %d",
+        name_buf, (unsigned long long)params, n_ctx);
+
+    return copy_to_buffer(info, out_buffer, buffer_size);
+}
+
+int LLMTC_CALL llmtc_get_n_ctx(void) {
+    if (!g_ctx) return 0;
+    return (int)llama_n_ctx(g_ctx);
+}
+
 // ---- 同期API ----
 
 const char* LLMTC_CALL llmtc_generate(const char* system_prompt, const char* user_message,
                                        double temperature, int max_tokens) {
-    // 入力は常にUTF-8として受け取る (変換しない)
     if (!do_generate(system_prompt ? system_prompt : "",
                      user_message  ? user_message  : "",
                      temperature, max_tokens)) return nullptr;
@@ -211,12 +260,10 @@ const char* LLMTC_CALL llmtc_generate(const char* system_prompt, const char* use
 int LLMTC_CALL llmtc_generate_to_buffer(const char* system_prompt, const char* user_message,
                                          double temperature, int max_tokens,
                                          char* out_buffer, int buffer_size) {
-    // 入力は常にUTF-8として受け取る (変換しない)
     bool ok = do_generate(system_prompt ? system_prompt : "",
                           user_message  ? user_message  : "",
                           temperature, max_tokens);
     if (!ok) return copy_to_buffer(nullptr, out_buffer, buffer_size);
-    // 出力だけをエンコーディング変換する
     return copy_to_buffer_encoded(g_reply_buffer, out_buffer, buffer_size);
 }
 
@@ -231,15 +278,14 @@ int LLMTC_CALL llmtc_generate_async(const char* system_prompt, const char* user_
 
     g_status.store(LLMTC_STATUS_BUSY);
 
-    // 入力は常にUTF-8として受け取る (変換しない)。スレッドに渡すためコピーだけする。
     std::string sp = system_prompt ? system_prompt : "";
     std::string um = user_message;
 
     g_worker_thread = std::thread([sp, um, temperature, max_tokens]() {
         bool ok = do_generate(sp.c_str(), um.c_str(), temperature, max_tokens);
         {
-            std::lock_guard<std::mutex> lock(g_result_mutex);
-            g_async_result = ok ? g_reply_buffer : ""; // 常にUTF-8で保持
+            std::lock_guard<std::mutex> lk(g_result_mutex);
+            g_async_result = ok ? g_reply_buffer : "";
         }
         g_status.store(ok ? LLMTC_STATUS_DONE : LLMTC_STATUS_ERROR);
     });
@@ -251,23 +297,15 @@ int LLMTC_CALL llmtc_get_status(void) {
     return g_status.load();
 }
 
+int LLMTC_CALL llmtc_get_partial_result_to_buffer(char* out_buffer, int buffer_size) {
+    std::lock_guard<std::mutex> lk(g_partial_mutex);
+    return copy_to_buffer_encoded(g_partial_buffer, out_buffer, buffer_size);
+}
+
 int LLMTC_CALL llmtc_get_result_to_buffer(char* out_buffer, int buffer_size) {
-    std::lock_guard<std::mutex> lock(g_result_mutex);
-    // 取り出し時に出力エンコーディングへ変換する
+    std::lock_guard<std::mutex> lk(g_result_mutex);
     int len = copy_to_buffer_encoded(g_async_result, out_buffer, buffer_size);
     g_async_result.clear();
     g_status.store(LLMTC_STATUS_IDLE);
     return len;
-}
-
-void LLMTC_CALL llmtc_free(void) {
-    if (g_worker_thread.joinable()) g_worker_thread.join();
-
-    if (g_ctx)   { llama_free(g_ctx);        g_ctx = nullptr; }
-    if (g_model) { llama_model_free(g_model); g_model = nullptr; }
-    llama_backend_free();
-
-    g_reply_buffer.clear();
-    g_async_result.clear();
-    g_status.store(LLMTC_STATUS_IDLE);
 }

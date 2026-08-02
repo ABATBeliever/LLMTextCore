@@ -1,18 +1,19 @@
-; LLMTextCore.dll 動作確認用スクリプト (0.5.0)
-; 【重要】このファイルはUTF-8で保存されています。
-;         HSPコンパイラがUTF-8ソースを読める場合はそのままでOK。
-;         文字化けする場合はShift-JISで保存し直してください。
-; 実行前に LLMTextCore.dll と同じフォルダに置いてください。
+#include "hsp3_64.as"
+; LLMTextCore.dll 動作確認スクリプト (0.6.0 / ストリーミング + モデル情報対応版)
+; このファイルはUTF-8で保存されています。
 
 #uselib "LLMTextCore.dll"
-#cfunc llmtc_version_info_to_buffer "llmtc_version_info_to_buffer" var, int
-#func  llmtc_set_verbose            "llmtc_set_verbose" int
-#func  llmtc_set_encoding           "llmtc_set_encoding" int
-#cfunc llmtc_init                   "llmtc_init" str, int, int
-#cfunc llmtc_generate_async         "llmtc_generate_async" str, str, double, int
-#cfunc llmtc_get_status             "llmtc_get_status"
-#cfunc llmtc_get_result_to_buffer   "llmtc_get_result_to_buffer" var, int
-#func  llmtc_free                   "llmtc_free"
+#cfunc llmtc_version_info_to_buffer    "llmtc_version_info_to_buffer"    var, int
+#func  llmtc_set_verbose               "llmtc_set_verbose"               int
+#func  llmtc_set_encoding              "llmtc_set_encoding"              int
+#cfunc llmtc_init                      "llmtc_init"                      str, int, int
+#func  llmtc_free                      "llmtc_free"
+#cfunc llmtc_get_model_info_to_buffer  "llmtc_get_model_info_to_buffer"  var, int
+#cfunc llmtc_get_n_ctx                 "llmtc_get_n_ctx"
+#cfunc llmtc_generate_async            "llmtc_generate_async"            str, str, double, int
+#cfunc llmtc_get_status                "llmtc_get_status"
+#cfunc llmtc_get_partial_result_to_buffer "llmtc_get_partial_result_to_buffer" var, int
+#cfunc llmtc_get_result_to_buffer      "llmtc_get_result_to_buffer"      var, int
 
 #const LLMTC_STATUS_IDLE   0
 #const LLMTC_STATUS_BUSY   1
@@ -21,60 +22,60 @@
 #const LLMTC_ENCODING_UTF8 0
 #const LLMTC_ENCODING_SJIS 1
 
-; ---- 設定 ----
-; モデルパス (バックスラッシュ衝突回避のため / 推奨)
 model_path = "C:/Users/abatb/Documents/models/Qwen3-1.7B-Q6_K.gguf"
+out_enc    = LLMTC_ENCODING_UTF8  ; 化ける場合は LLMTC_ENCODING_SJIS に変更
 
-; 出力エンコーディング設定:
-;   LLMTC_ENCODING_UTF8(0) ... DLLがUTF-8で返す (64bit HSPがUTF-8対応なら0でOK)
-;   LLMTC_ENCODING_SJIS(1) ... DLLがShift-JISに変換して返す (mes で化ける場合は1を試す)
-out_enc = LLMTC_ENCODING_UTF8
-
-; ---- バージョン確認 (ASCIIのみなのでエンコーディング不問) ----
+; --- バージョン ---
 sdim verbuf, 256
 dummy = llmtc_version_info_to_buffer(verbuf, 256)
 mes "Version: " + verbuf
 
-; ---- 初期設定 ----
+; --- 初期設定・モデルロード ---
 llmtc_set_verbose 0
-llmtc_set_encoding out_enc   ; 出力変換モードを設定
-
-; ---- モデル読み込み ----
-mes "Loading model..."
+llmtc_set_encoding out_enc
+mes "Loading..."
 redraw 1 : await 10
 
 rc = llmtc_init(model_path, 4096, 0)
-if rc != 0 {
-    mes "llmtc_init failed: rc=" + rc
-    stop
-}
-mes "Model loaded OK"
+if rc != 0 { mes "init failed: rc=" + rc : stop }
 
-; ---- 非同期生成 ----
-; 入力文字列はDLL側で変換しない (UTF-8として渡す)。
-; このファイルがUTF-8保存ならリテラルもUTF-8として正しく渡る。
-rc = llmtc_generate_async("You are a helpful assistant.", "Hello, please introduce yourself in Japanese.", 0.7, 256)
-if rc != 0 {
-    mes "generate_async failed: rc=" + rc
-    stop
-}
-mes "Generating..."
+; --- モデル情報表示 ---
+sdim infobuf, 512
+dummy = llmtc_get_model_info_to_buffer(infobuf, 512)
+mes "---- Model Info ----"
+mes infobuf
+ctx_len = llmtc_get_n_ctx()
+mes "n_ctx (int): " + ctx_len
+mes "--------------------"
 
-; ---- ポーリングループ ----
-*wait_loop
-    await 200
-    status = llmtc_get_status()
-    if status = LLMTC_STATUS_BUSY : goto *wait_loop
-    if status = LLMTC_STATUS_ERROR {
-        mes "Error during generation"
-        llmtc_free
-        stop
+; --- ストリーミング生成 ---
+mes "Generating (streaming)..."
+p1="あなたは親切なアシスタントです"
+p2="自己紹介をお願い"
+rc = llmtc_generate_async(cnvatos(p1), cnvatos(p2), 0.7, 256)
+if rc != 0 { mes "async failed: rc=" + rc : stop }
+
+; テキストボックスに逐次表示する例
+; (実際の使用では objprm や textarea で更新する方が見栄えが良い)
+sdim partial, 8192
+sdim prev, 8192
+prev = ""
+
+*stream_loop
+    await 50
+    dummy = llmtc_get_partial_result_to_buffer(partial, 8192)
+    if partial != prev {
+        ; 差分だけ表示 (mesは追記なので差分のみ切り出す)
+        delta = strmid(partial, strlen(prev), strlen(partial) - strlen(prev))
+        mes delta
+        prev = partial
     }
+    if llmtc_get_status() = LLMTC_STATUS_BUSY : goto *stream_loop
+    if llmtc_get_status() = LLMTC_STATUS_ERROR { mes "[ERROR]" : llmtc_free : stop }
 
-; ---- 結果取得 ----
-sdim reply, 8192
-len = llmtc_get_result_to_buffer(reply, 8192)
-mes "AI: " + reply
+; 最終結果を回収してステータスをIDLEに戻す
+sdim final, 8192
+dummy = llmtc_get_result_to_buffer(final, 8192)
 
 llmtc_free
-mes "Done"
+mes "---- Done ----"

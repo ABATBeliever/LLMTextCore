@@ -14,54 +14,61 @@
 #endif
 
 // llmtc_get_status の戻り値
-#define LLMTC_STATUS_IDLE   0  // 待機中
-#define LLMTC_STATUS_BUSY   1  // 生成中
-#define LLMTC_STATUS_DONE   2  // 生成完了 (llmtc_get_result_to_buffer で結果を取得できる)
-#define LLMTC_STATUS_ERROR -1  // 生成中にエラーが発生した
+#define LLMTC_STATUS_IDLE   0
+#define LLMTC_STATUS_BUSY   1
+#define LLMTC_STATUS_DONE   2
+#define LLMTC_STATUS_ERROR -1
 
 // llmtc_set_encoding の引数
-#define LLMTC_ENCODING_UTF8 0  // UTF-8 のまま (デフォルト、C/C++等向け)
-#define LLMTC_ENCODING_SJIS 1  // Shift-JIS (CP932) 自動変換 (HSP 3.x等向け)
+#define LLMTC_ENCODING_UTF8 0
+#define LLMTC_ENCODING_SJIS 1
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-// LLMTextCore自身のバージョンと、ビルドに使ったllama.cppのコミットハッシュを返す。
-// 戻り値は静的文字列なので free() しないこと。(C/C++向け)
+// ---- バージョン ----
 LLMTC_API const char* LLMTC_CALL llmtc_version_info(void);
+LLMTC_API int         LLMTC_CALL llmtc_version_info_to_buffer(char* out_buffer, int buffer_size);
 
-// バージョン文字列をバッファに書き込む (HSP等向け)
-LLMTC_API int LLMTC_CALL llmtc_version_info_to_buffer(char* out_buffer, int buffer_size);
-
-// デバッグログの表示有無を設定する (llmtc_init より前に呼ぶこと)
-// enable=0: エラーのみ表示 (デフォルト) / enable=1: llama.cppの詳細ログを全部表示
+// ---- 設定 ----
+// enable=0: エラーのみ表示 (デフォルト) / enable=1: 詳細ログ表示
 LLMTC_API void LLMTC_CALL llmtc_set_verbose(int enable);
 
-// 文字列入出力のエンコーディングを設定する。
-// LLMTC_ENCODING_UTF8(0): UTF-8のまま (デフォルト、C/C++等向け)
-// LLMTC_ENCODING_SJIS(1): Shift-JIS (CP932) 自動変換モード (HSP 3.x等向け)
-//   入力 (system_prompt, user_message) を CP932→UTF-8 に変換してllama.cppに渡し、
-//   *_to_buffer 系の出力は UTF-8→CP932 に変換してバッファに書き込む。
-//   llmtc_generate() (ポインタ返し) は常にUTF-8のまま。
+// LLMTC_ENCODING_UTF8(0): 入出力UTF-8のまま (デフォルト)
+// LLMTC_ENCODING_SJIS(1): 出力バッファをUTF-8→CP932変換 (HSP 3.x向け)
+// 注意: 入力 (system_prompt, user_message) は常にUTF-8を期待する
 LLMTC_API void LLMTC_CALL llmtc_set_encoding(int mode);
 
-// モデルを読み込んで初期化する。成功で0、失敗で負値を返す。
-// n_ctx: コンテキスト長 (0 ならデフォルト)
-// n_gpu_layers: GPUにオフロードする層数 (0 ならCPUのみ)
-LLMTC_API int LLMTC_CALL llmtc_init(const char* model_path, int n_ctx, int n_gpu_layers);
+// ---- 初期化 / 解放 ----
+// 成功で0、失敗で負値を返す
+// n_ctx=0 でデフォルト(4096)、n_gpu_layers=0 でCPUのみ
+LLMTC_API int  LLMTC_CALL llmtc_init(const char* model_path, int n_ctx, int n_gpu_layers);
+LLMTC_API void LLMTC_CALL llmtc_free(void);
+
+// ---- モデル情報 (llmtc_init の後に呼ぶこと) ----
+
+// ロード済みモデルの情報を1行ずつ改行区切りで返す。
+// 書式例:
+//   name: Qwen3 1.7B
+//   params: 2030000000
+//   n_ctx: 4096
+LLMTC_API int LLMTC_CALL llmtc_get_model_info_to_buffer(char* out_buffer, int buffer_size);
+
+// コンテキスト長をintで返す (llmtc_init 後のみ有効、未初期化時は0)
+LLMTC_API int LLMTC_CALL llmtc_get_n_ctx(void);
 
 // ---- 同期API (C/C++向け) ----
 
-// ステートレスな1回完結の応答生成。完了まで呼び出し元をブロックする。
-// 戻り値は内部バッファを指しているため free() しないこと。常にUTF-8。失敗時は NULL。
+// 1回完結の応答生成。完了まで呼び出し元をブロックする。
+// 戻り値は内部バッファへのポインタ (常にUTF-8)。解放不要。失敗時はNULL。
 LLMTC_API const char* LLMTC_CALL llmtc_generate(
     const char* system_prompt,
     const char* user_message,
     double temperature,
     int max_tokens);
 
-// 同上、バッファに書き込む版。llmtc_set_encoding の設定に従って変換する。
+// 同上、バッファに書き込む版。llmtc_set_encodingの設定に従って変換する。
 LLMTC_API int LLMTC_CALL llmtc_generate_to_buffer(
     const char* system_prompt,
     const char* user_message,
@@ -72,26 +79,29 @@ LLMTC_API int LLMTC_CALL llmtc_generate_to_buffer(
 
 // ---- 非同期API (HSP等のポーリング向け) ----
 
-// 生成をバックグラウンドスレッドで開始し、即リターンする。
-// 戻り値: 0=開始成功 / -1=前の生成がまだ実行中 / -2=初期化未完了
+// バックグラウンドで生成を開始して即リターン。
+// 戻り値: 0=成功 / -1=前の生成が実行中 / -2=未初期化
 LLMTC_API int LLMTC_CALL llmtc_generate_async(
     const char* system_prompt,
     const char* user_message,
     double temperature,
     int max_tokens);
 
-// 現在の非同期生成の状態を返す。
-// 戻り値: LLMTC_STATUS_IDLE(0) / LLMTC_STATUS_BUSY(1) /
-//         LLMTC_STATUS_DONE(2) / LLMTC_STATUS_ERROR(-1)
+// 現在の状態を返す。
+// LLMTC_STATUS_IDLE(0) / LLMTC_STATUS_BUSY(1) /
+// LLMTC_STATUS_DONE(2) / LLMTC_STATUS_ERROR(-1)
 LLMTC_API int LLMTC_CALL llmtc_get_status(void);
 
-// 非同期生成の結果をバッファに書き込む。LLMTC_STATUS_DONE の後にのみ呼ぶこと。
-// llmtc_set_encoding の設定に従って変換する。
-// 呼び出し後、状態は LLMTC_STATUS_IDLE に戻る。
-LLMTC_API int LLMTC_CALL llmtc_get_result_to_buffer(char* out_buffer, int buffer_size);
+// 生成中の途中テキストを「先頭からの全文」で返す (BUSY中でも呼べる)。
+// ストリーミング表示用。呼ぶたびに増えていく。
+// 前回呼んだときとの差分を取るのは呼び出し側の責任。
+// llmtc_set_encodingの設定に従って変換する。
+LLMTC_API int LLMTC_CALL llmtc_get_partial_result_to_buffer(char* out_buffer, int buffer_size);
 
-// モデル・コンテキストを解放する。生成中の場合は完了を待ってから解放する。
-LLMTC_API void LLMTC_CALL llmtc_free(void);
+// 生成完了後、最終結果をバッファに書き込む (DONE後のみ有効)。
+// 呼び出し後、状態はIDLEに戻る。
+// llmtc_set_encodingの設定に従って変換する。
+LLMTC_API int LLMTC_CALL llmtc_get_result_to_buffer(char* out_buffer, int buffer_size);
 
 #ifdef __cplusplus
 }
