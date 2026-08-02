@@ -13,7 +13,6 @@ static char* wide_to_utf8(const wchar_t* w) {
     WideCharToMultiByte(CP_UTF8, 0, w, -1, buf, len, NULL, NULL);
     return buf;
 }
-
 static char* utf8_to_sjis(const char* utf8) {
     int wlen = MultiByteToWideChar(CP_UTF8, 0, utf8, -1, NULL, 0);
     wchar_t* ws = (wchar_t*)malloc(sizeof(wchar_t) * (size_t)wlen);
@@ -29,17 +28,19 @@ static char* utf8_to_sjis(const char* utf8) {
 static void print_usage(const char* prog) {
     printf("LLMTextCore CLI\n\n");
     printf("使い方:\n");
-    printf("  %s <model.gguf> [質問文] [temperature] [max_tokens] [verbose] [encoding] [stream]\n", prog);
+    printf("  %s <model.gguf> [質問文] [temperature] [max_tokens] [verbose] [encoding] [stream] [top_p] [repeat_penalty]\n", prog);
     printf("  %s -l <model.gguf> [verbose]   モデルのロード確認のみ行う\n", prog);
     printf("  %s -i <model.gguf> [verbose]   モデル情報を表示して終了\n", prog);
-    printf("  %s -v, --version               バージョン情報を表示して終了\n", prog);
-    printf("  %s -h, --help                  このヘルプを表示して終了\n\n", prog);
+    printf("  %s -v, --version\n", prog);
+    printf("  %s -h, --help\n\n", prog);
     printf("引数:\n");
-    printf("  temperature  生成の温度。0以下または省略でデフォルト値 (0.7)\n");
-    printf("  max_tokens   最大トークン数。0以下または省略でデフォルト値 (512)\n");
-    printf("  verbose      0=ログ抑制 (デフォルト) / 1=llama.cpp詳細ログを表示\n");
-    printf("  encoding     0=UTF-8出力 (デフォルト) / 1=Shift-JIS出力\n");
-    printf("  stream       0=完了後に一括出力 (デフォルト) / 1=生成しながら逐次出力\n\n");
+    printf("  temperature    生成の温度。0以下または省略でデフォルト値 (0.7)\n");
+    printf("  max_tokens     最大トークン数。0以下または省略でデフォルト値 (512)\n");
+    printf("  verbose        0=ログ抑制 (デフォルト) / 1=llama.cpp詳細ログを表示\n");
+    printf("  encoding       0=UTF-8出力 (デフォルト) / 1=Shift-JIS出力\n");
+    printf("  stream         0=完了後に一括出力 (デフォルト) / 1=逐次出力\n");
+    printf("  top_p          0以下または省略でデフォルト値 (0.95) / 1.0で無効化\n");
+    printf("  repeat_penalty 0以下または省略でデフォルト値 (1.0=無効) / 例: 1.1\n\n");
     printf("通常実行時、標準出力にはAIの応答のみが出力されます。\n");
     printf("エラーメッセージは標準エラー出力に出ます。\n");
 }
@@ -58,10 +59,7 @@ static int run_load_check(const char* model_path, int verbose) {
 static int run_model_info(const char* model_path, int verbose) {
     llmtc_set_verbose(verbose);
     int rc = llmtc_init(model_path, 4096, 0);
-    if (rc != 0) {
-        fprintf(stderr, "llmtc_init 失敗 (rc=%d)\n", rc);
-        return 1;
-    }
+    if (rc != 0) { fprintf(stderr, "llmtc_init 失敗 (rc=%d)\n", rc); return 1; }
     char info[512];
     llmtc_get_model_info_to_buffer(info, sizeof(info));
     printf("%s\n", info);
@@ -69,7 +67,6 @@ static int run_model_info(const char* model_path, int verbose) {
     return 0;
 }
 
-// エンコーディングに応じてstrをstdoutに書き出す。改行はつけない。
 static void print_encoded(const char* utf8_str, int encoding) {
 #ifdef _WIN32
     if (encoding == LLMTC_ENCODING_SJIS) {
@@ -88,7 +85,6 @@ static void print_encoded(const char* utf8_str, int encoding) {
 
 int main(int argc, char** argv) {
 #ifdef _WIN32
-    // コンソールはUTF-8に固定。Shift-JIS出力が必要な場合はソフトウェア変換で対応。
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
 
@@ -118,62 +114,51 @@ int main(int argc, char** argv) {
         return run_model_info(argv[2], (argc >= 4) ? atoi(argv[3]) : 0);
     }
 
-    const char* model_path = argv[1];
-    const char* question   = (argc >= 3) ? argv[2] : "こんにちは、自己紹介してください。";
-    double temperature     = (argc >= 4) ? atof(argv[3]) : -1.0;
-    int    max_tokens      = (argc >= 5) ? atoi(argv[4]) : -1;
-    int    verbose         = (argc >= 6) ? atoi(argv[5]) : 0;
-    int    encoding        = (argc >= 7) ? atoi(argv[6]) : LLMTC_ENCODING_UTF8;
-    int    stream          = (argc >= 8) ? atoi(argv[7]) : 0;
+    const char* model_path   = argv[1];
+    const char* question     = (argc >= 3) ? argv[2] : "こんにちは、自己紹介してください。";
+    double temperature       = (argc >= 4) ? atof(argv[3]) : -1.0;
+    int    max_tokens        = (argc >= 5) ? atoi(argv[4]) : -1;
+    int    verbose           = (argc >= 6) ? atoi(argv[5]) : 0;
+    int    encoding          = (argc >= 7) ? atoi(argv[6]) : LLMTC_ENCODING_UTF8;
+    int    stream            = (argc >= 8) ? atoi(argv[7]) : 0;
+    double top_p             = (argc >= 9) ? atof(argv[8]) : -1.0;
+    double repeat_penalty    = (argc >= 10)? atof(argv[9]) : -1.0;
 
     llmtc_set_verbose(verbose);
+    llmtc_set_generation_params(top_p, repeat_penalty, 0);
 
     int rc = llmtc_init(model_path, 4096, 0);
     if (rc != 0) { fprintf(stderr, "llmtc_init 失敗 (rc=%d)\n", rc); return 1; }
 
     if (!stream) {
-        // 通常モード: 完了してから一括出力
         const char* reply = llmtc_generate(
             "あなたは親切な日本語アシスタントです。",
             question, temperature, max_tokens);
-        if (!reply) {
-            fprintf(stderr, "応答の取得に失敗しました\n");
-            llmtc_free();
-            return 1;
-        }
+        if (!reply) { fprintf(stderr, "応答の取得に失敗しました\n"); llmtc_free(); return 1; }
         print_encoded(reply, encoding);
         printf("\n");
     } else {
-        // ストリーミングモード: 非同期生成 + ポーリングで差分を随時出力
         rc = llmtc_generate_async(
             "あなたは親切な日本語アシスタントです。",
             question, temperature, max_tokens);
-        if (rc != 0) {
-            fprintf(stderr, "generate_async 失敗 (rc=%d)\n", rc);
-            llmtc_free();
-            return 1;
-        }
+        if (rc != 0) { fprintf(stderr, "generate_async 失敗 (rc=%d)\n", rc); llmtc_free(); return 1; }
 
-        char partial[65536]  = "";
-        char prev[65536]     = "";
-        int  prev_len        = 0;
+        char partial[65536] = "";
+        int  prev_len = 0;
 
         while (llmtc_get_status() == LLMTC_STATUS_BUSY) {
             llmtc_get_partial_result_to_buffer(partial, sizeof(partial));
             int cur_len = (int)strlen(partial);
             if (cur_len > prev_len) {
-                // 増えた分だけ出力
                 print_encoded(partial + prev_len, encoding);
                 prev_len = cur_len;
-                memcpy(prev, partial, (size_t)cur_len + 1);
             }
 #ifdef _WIN32
             Sleep(10);
 #endif
         }
-        printf("\n"); // 生成終了後に改行
+        printf("\n");
 
-        // 結果を回収してステータスをIDLEに戻す
         char final_buf[65536];
         llmtc_get_result_to_buffer(final_buf, sizeof(final_buf));
     }

@@ -24,7 +24,7 @@ add_subdirectory(llama.cpp)
 
 # ----- バージョン情報の埋め込み -----
 # LLMTextCore自体のバージョン。リリースごとに更新する。
-set(LLMTEXTCORE_VERSION "0.6.0")
+set(LLMTEXTCORE_VERSION "0.7.0")
 
 # llama.cppサブモジュールのコミットハッシュを取得 (失敗時は "unknown")
 find_package(Git QUIET)
