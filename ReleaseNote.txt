@@ -1,0 +1,111 @@
+LLMTextCore Release Notes
+=========================
+
+
+------------------------------------------------------------------------
+v0.7.1
+------------------------------------------------------------------------
+Bug fixes / Reliability
+
+- [DLL/EXE] 二重初期化ガードを追加。
+  llmtc_free を呼ばずに llmtc_init を再度呼んだ場合、従来はメモリリークが
+  発生していたが、-3 を即座に返して処理を中止するようになった。
+
+- [DLL] llmtc_get_last_error_to_buffer を追加。
+  llmtc_init の失敗原因を文字列で取得できるようになった。
+  llama.cpp が出力するエラーログと、独自のエラーメッセージを蓄積して返す。
+  llmtc_init を呼ぶたびにリセットされる。
+
+- [EXE] llmtc_init 失敗時のエラーメッセージに、上記エラー内容を付記するよう改善。
+
+
+------------------------------------------------------------------------
+v0.7.0
+------------------------------------------------------------------------
+
+- [DLL] llmtc_cancel を追加。
+  生成中に呼ぶと、次のトークン生成前(数十ms以内)に生成を中断する。
+
+- [DLL] LLMTC_STATUS_CANCELLED (=3) を追加。
+  キャンセル後のステータスで、llmtc_get_result_to_buffer から
+  途中まで生成されたテキストを取得できる。
+  DONE と同じ手順で結果を取り出せる。
+
+- [DLL] llmtc_set_generation_params(top_p, repeat_penalty, penalty_last_n) を追加。
+  Top-p (nucleus sampling) と Repeat penalty を設定できるようになった。
+  0以下を渡した引数はデフォルト値を維持する (top_p=0.95, repeat_penalty=1.0)。
+  llmtc_init の前後どちらでも呼べる。
+
+- [DLL] サンプラーチェーンを刷新。
+  penalties → top_p → temperature → dist の順で適用するよう変更。
+
+- [EXE] 引数 8番目に top_p、9番目に repeat_penalty を追加。
+
+
+------------------------------------------------------------------------
+v0.6.0
+------------------------------------------------------------------------
+
+- [DLL] llmtc_get_partial_result_to_buffer を追加。
+  非同期生成中 (BUSY) でも呼べる。生成済みのテキストを先頭からの全文で返す。
+  前回呼んだ時との差分を取ることで、ストリーミング表示が実現できる。
+
+- [DLL] llmtc_get_model_info_to_buffer を追加。
+  ロード済みモデルの名前、パラメータ数、コンテキスト長を改行区切りで返す。
+
+- [DLL] llmtc_get_n_ctx を追加。
+  コンテキスト長をintで返す。
+
+- [EXE] -i <model.gguf> オプションを追加。モデル情報を表示して終了する。
+
+- [EXE] 引数 7番目 (stream) を追加。
+  1を指定するとトークンを生成しながら標準出力に逐次出力する。
+
+
+------------------------------------------------------------------------
+v0.5.0
+------------------------------------------------------------------------
+
+- [DLL] 非同期APIを追加。
+    llmtc_generate_async  生成をバックグラウンドスレッドで開始して即リターン
+    llmtc_get_status      現在の生成状態を返す (IDLE/BUSY/DONE/ERROR)
+    llmtc_get_result_to_buffer  生成完了後に結果を取得
+
+- [DLL] llmtc_set_encoding を追加。
+  LLMTC_ENCODING_UTF8 (0, デフォルト) と LLMTC_ENCODING_SJIS (1) を選択できる。
+  SJIS を指定すると *_to_buffer 系の出力をUTF-8→CP932に変換して書き込む。
+  入力 (system_prompt, user_message) は常にUTF-8として受け取る。
+
+- [EXE] 引数 6番目 (encoding) を追加。
+  1を指定するとShift-JIS出力になる。pipeexecで読む場合に使用する。
+
+- [EXE] コンソールのコードページを起動時にUTF-8に固定するよう変更。
+  -h, -v などの出力が文字化けしなくなった。
+
+
+------------------------------------------------------------------------
+v0.4.0
+------------------------------------------------------------------------
+基本機能が完成したため、GitHubに公開した最初のバージョン。
+
+- [DLL] 基本APIを確立。
+    llmtc_version_info / llmtc_version_info_to_buffer
+    llmtc_set_verbose
+    llmtc_init / llmtc_free
+    llmtc_generate / llmtc_generate_to_buffer (同期、ステートレス)
+
+- [DLL] ステートレス設計を採用。
+  DLL側は会話履歴を保持せず、呼び出しのたびに1ターン完結で応答を生成する。
+
+- [DLL] 生成パラメータ (temperature, max_tokens) を引数で指定できる。
+
+- [EXE] 基本的なCLIを実装。
+  引数: <model.gguf> [質問文] [temperature] [max_tokens] [verbose] [encoding]
+  -v, --version / -h, --help / -l (ロード確認) を実装。
+  標準出力にはAIの応答のみ、エラーは標準エラー出力に分離。
+
+- [DLL/EXE] llmtextcore.def によりエクスポート名を装飾なしで固定。
+  64bit HSP を含む呼び出し側から一貫した関数名でアクセスできる。
+
+- [DLL/EXE] llama.cpp を静的リンク。
+  配布物は LLMTextCore.dll + LLMTextCore.exe + .ggufモデルのみで動作する。

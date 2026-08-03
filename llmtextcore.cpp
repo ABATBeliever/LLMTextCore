@@ -44,6 +44,10 @@ static float  g_top_p          = 0.95f;
 static float  g_repeat_penalty = 1.0f;   // 1.0 = 無効
 static int    g_penalty_last_n = 64;
 
+// エラーメッセージ: llmtc_init のたびにクリアし、ERRORログや独自エラーを追記する
+static std::mutex  g_error_mutex;
+static std::string g_last_error;
+
 // ----- エンコーディング変換 -----
 
 #ifdef _WIN32
@@ -88,6 +92,11 @@ static int copy_to_buffer_encoded(const std::string& utf8_src, char* out_buffer,
 static void llmtc_log_callback(ggml_log_level level, const char* text, void* user_data) {
     (void)user_data;
     if (g_verbose || level == GGML_LOG_LEVEL_ERROR) fputs(text, stderr);
+    // ERRORレベルのログはg_last_errorにも蓄積する
+    if (level == GGML_LOG_LEVEL_ERROR && text) {
+        std::lock_guard<std::mutex> lk(g_error_mutex);
+        g_last_error += text;
+    }
 }
 
 // ----- 生成処理本体 -----
@@ -200,6 +209,19 @@ int LLMTC_CALL llmtc_set_generation_params(double top_p, double repeat_penalty, 
 }
 
 int LLMTC_CALL llmtc_init(const char* model_path, int n_ctx, int n_gpu_layers) {
+    // 二重初期化ガード
+    if (g_model != nullptr) {
+        std::lock_guard<std::mutex> lk(g_error_mutex);
+        g_last_error = "llmtc_init: already initialized, call llmtc_free first";
+        return -3;
+    }
+
+    // エラーログをリセットしてから初期化開始
+    {
+        std::lock_guard<std::mutex> lk(g_error_mutex);
+        g_last_error.clear();
+    }
+
     llama_log_set(llmtc_log_callback, nullptr);
     llama_backend_init();
 
@@ -225,8 +247,15 @@ void LLMTC_CALL llmtc_free(void) {
     g_reply_buffer.clear();
     g_async_result.clear();
     { std::lock_guard<std::mutex> lk(g_partial_mutex); g_partial_buffer.clear(); }
+    { std::lock_guard<std::mutex> lk(g_error_mutex);   g_last_error.clear(); }
     g_status.store(LLMTC_STATUS_IDLE);
     g_cancel_flag.store(false);
+}
+
+int LLMTC_CALL llmtc_get_last_error_to_buffer(char* out_buffer, int buffer_size) {
+    std::lock_guard<std::mutex> lk(g_error_mutex);
+    return copy_to_buffer(g_last_error.empty() ? "(no error)" : g_last_error.c_str(),
+                          out_buffer, buffer_size);
 }
 
 int LLMTC_CALL llmtc_get_model_info_to_buffer(char* out_buffer, int buffer_size) {

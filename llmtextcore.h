@@ -47,8 +47,18 @@ LLMTC_API void LLMTC_CALL llmtc_set_encoding(int mode);
 LLMTC_API int LLMTC_CALL llmtc_set_generation_params(double top_p, double repeat_penalty, int penalty_last_n);
 
 // ---- 初期化 / 解放 ----
+// 成功で0、失敗で負値を返す。
+// -1: モデルファイルの読み込み失敗
+// -2: コンテキストの初期化失敗
+// -3: すでに初期化済み (llmtc_free を呼んでから再度呼ぶこと)
+// 失敗時は llmtc_get_last_error_to_buffer でエラー内容を取得できる。
 LLMTC_API int  LLMTC_CALL llmtc_init(const char* model_path, int n_ctx, int n_gpu_layers);
 LLMTC_API void LLMTC_CALL llmtc_free(void);
+
+// 直近のエラーメッセージをバッファに書き込む。
+// llmtc_init 失敗時に呼ぶことで原因を確認できる。
+// llmtc_init を呼ぶたびにリセットされる。
+LLMTC_API int LLMTC_CALL llmtc_get_last_error_to_buffer(char* out_buffer, int buffer_size);
 
 // ---- モデル情報 ----
 LLMTC_API int LLMTC_CALL llmtc_get_model_info_to_buffer(char* out_buffer, int buffer_size);

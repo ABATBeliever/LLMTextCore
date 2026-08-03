@@ -7,6 +7,7 @@ EXPORTS
     llmtc_set_generation_params
     llmtc_init
     llmtc_free
+    llmtc_get_last_error_to_buffer
     llmtc_get_model_info_to_buffer
     llmtc_get_n_ctx
     llmtc_generate

@@ -49,17 +49,21 @@ static int run_load_check(const char* model_path, int verbose) {
     llmtc_set_verbose(verbose);
     int rc = llmtc_init(model_path, 4096, 0);
     if (rc == 0) { printf("OK\n"); llmtc_free(); return 0; }
-    const char* reason =
-        (rc == -1) ? "モデルファイルの読み込みに失敗しました" :
-        (rc == -2) ? "コンテキストの初期化に失敗しました" : "不明なエラー";
-    printf("NG: %s (rc=%d)\n", reason, rc);
+    char errbuf[1024];
+    llmtc_get_last_error_to_buffer(errbuf, sizeof(errbuf));
+    printf("NG: rc=%d: %s\n", rc, errbuf);
     return 1;
 }
 
 static int run_model_info(const char* model_path, int verbose) {
     llmtc_set_verbose(verbose);
     int rc = llmtc_init(model_path, 4096, 0);
-    if (rc != 0) { fprintf(stderr, "llmtc_init 失敗 (rc=%d)\n", rc); return 1; }
+    if (rc != 0) {
+        char errbuf[1024];
+        llmtc_get_last_error_to_buffer(errbuf, sizeof(errbuf));
+        fprintf(stderr, "llmtc_init 失敗 (rc=%d): %s\n", rc, errbuf);
+        return 1;
+    }
     char info[512];
     llmtc_get_model_info_to_buffer(info, sizeof(info));
     printf("%s\n", info);
@@ -128,7 +132,12 @@ int main(int argc, char** argv) {
     llmtc_set_generation_params(top_p, repeat_penalty, 0);
 
     int rc = llmtc_init(model_path, 4096, 0);
-    if (rc != 0) { fprintf(stderr, "llmtc_init 失敗 (rc=%d)\n", rc); return 1; }
+    if (rc != 0) {
+        char errbuf[1024];
+        llmtc_get_last_error_to_buffer(errbuf, sizeof(errbuf));
+        fprintf(stderr, "llmtc_init 失敗 (rc=%d): %s\n", rc, errbuf);
+        return 1;
+    }
 
     if (!stream) {
         const char* reply = llmtc_generate(

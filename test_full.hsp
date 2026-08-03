@@ -22,6 +22,7 @@ pos 0,0
 #cfunc llmtc_get_status                   "llmtc_get_status"
 #cfunc llmtc_get_partial_result_to_buffer "llmtc_get_partial_result_to_buffer" var, int
 #cfunc llmtc_get_result_to_buffer         "llmtc_get_result_to_buffer"         var, int
+#cfunc llmtc_get_last_error_to_buffer "llmtc_get_last_error_to_buffer" var, int
 
 #const LLMTC_STATUS_IDLE      0
 #const LLMTC_STATUS_BUSY      1
@@ -49,8 +50,14 @@ dummy = llmtc_set_generation_params(0.95, 1.1, 0)
 ; --- モデルロード ---
 mes "Loading..."
 redraw 1 : await 10
+
 rc = llmtc_init(model_path, 4096, 0)
-if rc != 0 { mes "init failed: rc=" + rc : stop }
+if rc != 0 {
+    sdim errbuf, 1024
+    dummy = llmtc_get_last_error_to_buffer(errbuf, 1024)
+    mes "init failed rc=" + rc + ": " + errbuf
+    stop
+}
 
 ; --- モデル情報 ---
 sdim infobuf, 512
