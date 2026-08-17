@@ -3,6 +3,99 @@ LLMTextCore Release Notes
 
 
 ------------------------------------------------------------------------
+v0.7.4
+------------------------------------------------------------------------
+Bug fixes / Concurrency
+
+- [DLL] 同期APIと非同期APIの同時実行によるデータ競合を修正。
+  llmtc_generate / llmtc_generate_to_buffer が非同期生成の状態(g_status)を
+  確認せずに動作していたため、llmtc_generate_async の実行中に同期APIを呼ぶと、
+  g_reply_buffer や g_ctx へ2つのスレッドから同時にアクセスし得た。
+  開始条件の判定とBUSYへの変更をアトミックに行う try_start_generation() を
+  新設し、同期・非同期どちらの入口もこれを通すよう修正した。
+  非同期生成が実行中、またはDONE/CANCELLEDの結果が未取得の間、同期APIは
+  失敗するようになった (llmtc_generate はNULL、llmtc_generate_to_buffer は
+  負値を返す)。同期APIのみ、または非同期APIのみを使う通常の利用では
+  挙動に変化はない。
+
+- [DLL] llmtc_generate_async のステータス判定に残っていた TOCTOU レースを修正。
+  「状態を読む」→「BUSYに書き込む」の2ステップの間に別スレッドが割り込むと、
+  複数の呼び出しが同時に開始条件を通過し得た。
+  compare_exchange によるCASループ (try_start_generation) に置き換え、
+  判定と変更を1つのアトミック操作にまとめた。返すエラーコード(-1/-2/-4)に
+  変更はない。
+
+- [DLL] g_last_error が生成のたびに際限なく蓄積する問題を修正。
+  llmtc_init のときにしかクリアされておらず、セッション中に出たERRORログが
+  次の生成呼び出しの結果と混ざったまま無制限に連結され続けていた。
+  do_generate の先頭で毎回クリアするよう修正し、防衛的にログコールバック側にも
+  サイズ上限(4KB)を追加した。
+
+- [DLL] llmtc_free が生成完了まで無期限にブロックする問題を修正。
+  BUSY中に呼ぶと max_tokens 分の生成が終わるまで戻らなかった。
+  呼び出し時に内部でキャンセルフラグを立ててから join するよう修正し、
+  実行中の生成があってもすぐに解放処理へ進めるようにした。
+
+
+------------------------------------------------------------------------
+v0.7.3
+------------------------------------------------------------------------
+Bug fixes / Security
+
+- [DLL] 生成ループのダングリングポインタを修正。
+  ループ内ローカル変数 next_input を参照した batch をループをまたいで
+  使用していたため、イテレーション終了後にポインタが無効になっていた。
+  next_input をループ外に移動することで修正した。
+
+- [DLL] llama_chat_apply_template の2回目呼び出し結果を未チェックだった問題を修正。
+  バッファ拡張後の再呼び出しが失敗した場合、負値を std::string に渡して
+  メモリ破壊が起きる可能性があった。
+
+- [DLL] llmtc_init に model_path の NULL チェックを追加。
+  NULL を渡すと llama.cpp 内部でクラッシュしていたが、エラーコード -1 と
+  エラーメッセージを返すよう修正した。
+
+- [DLL] llama_backend_free の二重呼び出しを防止。
+  llmtc_free を2回呼んだ場合に llama_backend_free が重複して呼ばれる問題を
+  g_backend_initialized フラグで管理するよう修正した。
+  llmtc_init の失敗パスでも正しくバックエンドを解放するようになった。
+
+- [DLL] llmtc_get_result_to_buffer に BUSY 中の呼び出しガードを追加。
+  生成中に呼ぶとステータスを強制的に IDLE に戻してしまう問題を修正。
+  BUSY 中は -3 を返して状態を変更しないようにした。
+
+- [DLL] llmtc_generate_async に DONE/CANCELLED 状態のガードを追加。
+  前の生成結果を llmtc_get_result_to_buffer で取り出す前に再度呼んだ場合、
+  前の結果が無言で消えていた。-4 を返して呼び出しを拒否するようにした。
+
+- [DLL] llmtc_generate_async のステータスを2回ロードしていた問題を修正。
+  1回のロードで判定するよう変更した。
+
+- [DLL] llmtc_free の g_async_result.clear() に g_result_mutex を追加。
+  join 後は安全だが、防衛的にミューテックスを取るよう修正した。
+
+- [DLL] n_tokens <= 0 のチェックを追加。
+  トークナイズ結果が空の場合に早期 return するよう修正した。
+
+- [DLL] llama_sampler_init_penalties を正しい5引数シグネチャに修正。
+  (n_vocab, penalty_last_n, penalty_repeat, penalty_freq, penalty_present)
+  n_vocab の取得に llama_vocab_n_tokens を使用するよう修正した。
+  これにより penalty_last_n が実際に機能するようになった。
+
+- [DLL] ビルド時の C4005 警告 (LLMTEXTCORE_EXPORTS マクロ再定義) を修正。
+  CMakeLists.txt がコンパイルフラグで定義済みのため、
+  llmtextcore.cpp 先頭の #define を削除した。
+
+- [EXE/CLI] wide_to_utf8 / utf8_to_sjis の malloc 戻り値 NULL チェックを追加。
+  OOM 時に NULL ポインタへ書き込むことでクラッシュする可能性があった。
+
+- [EXE/CLI] print_encoded の utf8_to_sjis 結果 NULL ガードを追加。
+
+- [EXE/CLI] argv (uargv) のメモリリークを修正。
+  goto cleanup パターンにより、main 終了前に確実に解放するよう変更した。
+
+
+------------------------------------------------------------------------
 v0.7.1
 ------------------------------------------------------------------------
 Bug fixes / Reliability

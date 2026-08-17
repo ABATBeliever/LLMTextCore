@@ -53,11 +53,20 @@ LLMTC_API int LLMTC_CALL llmtc_set_generation_params(double top_p, double repeat
 // -3: すでに初期化済み (llmtc_free を呼んでから再度呼ぶこと)
 // 失敗時は llmtc_get_last_error_to_buffer でエラー内容を取得できる。
 LLMTC_API int  LLMTC_CALL llmtc_init(const char* model_path, int n_ctx, int n_gpu_layers);
+
+// [v0.7.4] llmtc_generate_async 実行中に呼ばれた場合、内部で自動的にキャンセルしてから
+// 解放処理を行う (完了まで無期限にブロックすることはない)。
+// 注意: あくまで llmtc_generate_async のワーカースレッドに対する安全策であり、
+// llmtc_generate / llmtc_generate_to_buffer (同期API) の実行中に「別スレッドから」
+// llmtc_free を呼ぶケースは想定していない。同期APIは呼び出したスレッドをブロックする
+// ので、free は同じスレッドで同期APIの呼び出しが終わった後に呼ぶこと。
 LLMTC_API void LLMTC_CALL llmtc_free(void);
 
 // 直近のエラーメッセージをバッファに書き込む。
 // llmtc_init 失敗時に呼ぶことで原因を確認できる。
 // llmtc_init を呼ぶたびにリセットされる。
+// [v0.7.4] 加えて、生成系API (同期/非同期問わず) を呼ぶたびにもリセットされるため、
+// 「今回の呼び出しで何が起きたか」がそれ以前の呼び出しの残骸と混ざらなくなった。
 LLMTC_API int LLMTC_CALL llmtc_get_last_error_to_buffer(char* out_buffer, int buffer_size);
 
 // ---- モデル情報 ----
@@ -65,6 +74,16 @@ LLMTC_API int LLMTC_CALL llmtc_get_model_info_to_buffer(char* out_buffer, int bu
 LLMTC_API int LLMTC_CALL llmtc_get_n_ctx(void);
 
 // ---- 同期API ----
+//
+// [v0.7.4] llmtc_generate_async によるバックグラウンド生成が実行中の場合、
+// または DONE/CANCELLED の結果が未取得の場合、これらの同期APIは失敗する
+// (llmtc_generate は NULL、llmtc_generate_to_buffer は負値を返す。
+//  詳細は llmtc_get_last_error_to_buffer で確認できる)。
+// 同期APIだけを使う通常の利用ではこの状態にはならないため、挙動に変化はない。
+//
+// llmtc_generate が返すポインタは、次に llmtc_generate / llmtc_generate_to_buffer /
+// llmtc_generate_async のいずれかを呼ぶまでの間のみ有効。使い終わったら
+// すぐに文字列としてコピーするか出力すること (strerror 等と同様の一時バッファ)。
 LLMTC_API const char* LLMTC_CALL llmtc_generate(
     const char* system_prompt,
     const char* user_message,

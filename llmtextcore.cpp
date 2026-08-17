@@ -1,4 +1,3 @@
-#define LLMTEXTCORE_EXPORTS
 #include "llmtextcore.h"
 #include "llama.h"
 #include "ggml.h"
@@ -43,6 +42,7 @@ static int    g_encoding       = LLMTC_ENCODING_UTF8;
 static float  g_top_p          = 0.95f;
 static float  g_repeat_penalty = 1.0f;   // 1.0 = 無効
 static int    g_penalty_last_n = 64;
+static bool   g_backend_initialized = false; // llama_backend_init/free の対称呼び出し管理
 
 // エラーメッセージ: llmtc_init のたびにクリアし、ERRORログや独自エラーを追記する
 static std::mutex  g_error_mutex;
@@ -93,9 +93,13 @@ static void llmtc_log_callback(ggml_log_level level, const char* text, void* use
     (void)user_data;
     if (g_verbose || level == GGML_LOG_LEVEL_ERROR) fputs(text, stderr);
     // ERRORレベルのログはg_last_errorにも蓄積する
+    // (1回の生成中に大量のERRORログが出ても際限なく肥大化しないよう上限を設ける。
+    //  本体は do_generate() の先頭で毎回クリアされるので、通常はここまで溜まらない)
     if (level == GGML_LOG_LEVEL_ERROR && text) {
         std::lock_guard<std::mutex> lk(g_error_mutex);
-        g_last_error += text;
+        if (g_last_error.size() < 4096) {
+            g_last_error += text;
+        }
     }
 }
 
@@ -112,6 +116,14 @@ static bool do_generate(const char* system_prompt_utf8, const char* user_message
     }
 
     if (!g_ctx || !g_model || !user_message_utf8) return false;
+
+    // 今回の生成用にエラーバッファをリセットする。
+    // (v0.7.3では llmtc_init のときしかクリアされず、以降の生成で出たERRORログが
+    //  セッション終了まで無制限に蓄積し続けていた)
+    {
+        std::lock_guard<std::mutex> lk(g_error_mutex);
+        g_last_error.clear();
+    }
 
     float temp     = (temperature > 0.0) ? (float)temperature : 0.7f;
     int   max_tok  = (max_tokens  > 0)   ? max_tokens         : 512;
@@ -132,6 +144,7 @@ static bool do_generate(const char* system_prompt_utf8, const char* user_message
         buf.resize(n);
         n = llama_chat_apply_template(
             tmpl, msgs.data(), msgs.size(), true, buf.data(), (int32_t)buf.size());
+        if (n < 0) return false; // 2回目も失敗した場合のガード
     }
     std::string prompt(buf.data(), n);
 
@@ -139,15 +152,18 @@ static bool do_generate(const char* system_prompt_utf8, const char* user_message
 
     int n_tokens = -llama_tokenize(vocab, prompt.c_str(), (int32_t)prompt.size(),
                                    nullptr, 0, true, true);
+    if (n_tokens <= 0) return false; // 空プロンプトや異常時のガード
     std::vector<llama_token> tokens(n_tokens);
     llama_tokenize(vocab, prompt.c_str(), (int32_t)prompt.size(),
                    tokens.data(), (int32_t)tokens.size(), true, true);
 
     // サンプラーチェーンを組み立てる
     // 順序: penalties → top_p → temperature → dist
+    // llama_sampler_init_penalties(n_vocab, penalty_last_n, penalty_repeat, penalty_freq, penalty_present)
+    const int32_t n_vocab = llama_vocab_n_tokens(vocab); // vocab は llama_model_get_vocab(g_model) 取得済み
     llama_sampler* sampler = llama_sampler_chain_init(llama_sampler_chain_default_params());
     llama_sampler_chain_add(sampler,
-        llama_sampler_init_penalties(g_penalty_last_n, g_repeat_penalty, 0.0f, 0.0f));
+        llama_sampler_init_penalties(n_vocab, g_penalty_last_n, g_repeat_penalty, 0.0f, 0.0f));
     llama_sampler_chain_add(sampler, llama_sampler_init_top_p(g_top_p, 1));
     llama_sampler_chain_add(sampler, llama_sampler_init_temp(temp));
     llama_sampler_chain_add(sampler, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
@@ -155,6 +171,10 @@ static bool do_generate(const char* system_prompt_utf8, const char* user_message
     llama_batch batch = llama_batch_get_one(tokens.data(), (int32_t)tokens.size());
     int  n_generated = 0;
     bool success     = true;
+    // next_inputをループ外に宣言する。
+    // ループ内で宣言するとイテレーション終了時に破棄され、
+    // batch.tokenがダングリングポインタになるため。
+    llama_token next_input = 0;
 
     while (true) {
         // キャンセルチェック: 各トークンの生成前に確認する
@@ -173,7 +193,7 @@ static bool do_generate(const char* system_prompt_utf8, const char* user_message
             g_partial_buffer.append(piece, len);
         }
 
-        llama_token next_input = new_token;
+        next_input = new_token;
         batch = llama_batch_get_one(&next_input, 1);
 
         if (++n_generated >= max_tok) break;
@@ -181,6 +201,38 @@ static bool do_generate(const char* system_prompt_utf8, const char* user_message
 
     llama_sampler_free(sampler);
     return success;
+}
+
+// ----- 生成の排他制御 -----
+//
+// v0.7.3までは「g_status を読んで判断」→「後で BUSY に書き込む」の2段階になっており、
+// 別スレッドがその間に割り込む TOCTOU レースがあった。加えて、同期API (llmtc_generate系) は
+// この判断を一切行わずに do_generate() を呼んでいたため、非同期生成が実行中に同期APIを
+// 呼んでしまうと、g_reply_buffer やモデル/コンテキスト(g_ctx)へ2つのスレッドから同時に
+// アクセスすることになり、データ競合やクラッシュにつながり得た。
+//
+// v0.7.4では、同期・非同期どちらの入口も必ずこの try_start_generation() を通し、
+// 「開始してよいか判定」と「BUSYへの変更」を compare_exchange で1つのアトミック操作にまとめる。
+// これにより、以下の2つが同時に成立することはなくなる:
+//   ・同期APIの実行中(呼び出しスレッド上でdo_generateが走っている間)に別の生成が始まる
+//   ・非同期APIが2重に起動される
+//
+// 許可される開始元の状態は v0.7.3と同じ (IDLE または ERROR)。BUSY / DONE / CANCELLED からは
+// 開始できない、という外部から見た挙動は変更していない。
+static bool try_start_generation() {
+    int expected = g_status.load();
+    for (;;) {
+        if (expected == LLMTC_STATUS_BUSY ||
+            expected == LLMTC_STATUS_DONE ||
+            expected == LLMTC_STATUS_CANCELLED) {
+            return false;
+        }
+        // expected は IDLE か ERROR。ここで他スレッドが割り込んでいなければ BUSY にできる。
+        // 割り込まれていた場合は expected が最新値に更新されるので、ループして再判定する。
+        if (g_status.compare_exchange_weak(expected, LLMTC_STATUS_BUSY)) {
+            return true;
+        }
+    }
 }
 
 // ----- 公開API -----
@@ -203,7 +255,7 @@ void LLMTC_CALL llmtc_set_encoding(int mode)   {
 int LLMTC_CALL llmtc_set_generation_params(double top_p, double repeat_penalty, int penalty_last_n) {
     if (top_p          > 0.0) g_top_p          = (float)top_p;
     if (repeat_penalty > 0.0) g_repeat_penalty  = (float)repeat_penalty;
-    if (penalty_last_n > 0)   g_penalty_last_n  = penalty_last_n;
+    if (penalty_last_n > 0)        g_penalty_last_n = penalty_last_n;
     else if (penalty_last_n == -1) g_penalty_last_n = -1; // コンテキスト全体
     return 0;
 }
@@ -216,6 +268,13 @@ int LLMTC_CALL llmtc_init(const char* model_path, int n_ctx, int n_gpu_layers) {
         return -3;
     }
 
+    // model_path NULLチェック
+    if (!model_path) {
+        std::lock_guard<std::mutex> lk(g_error_mutex);
+        g_last_error = "llmtc_init: model_path is NULL";
+        return -1;
+    }
+
     // エラーログをリセットしてから初期化開始
     {
         std::lock_guard<std::mutex> lk(g_error_mutex);
@@ -224,28 +283,46 @@ int LLMTC_CALL llmtc_init(const char* model_path, int n_ctx, int n_gpu_layers) {
 
     llama_log_set(llmtc_log_callback, nullptr);
     llama_backend_init();
+    g_backend_initialized = true;
 
     llama_model_params mparams = llama_model_default_params();
     mparams.n_gpu_layers = n_gpu_layers;
 
     g_model = llama_model_load_from_file(model_path, mparams);
-    if (!g_model) return -1;
+    if (!g_model) {
+        llama_backend_free();
+        g_backend_initialized = false;
+        return -1;
+    }
 
     llama_context_params cparams = llama_context_default_params();
     cparams.n_ctx = n_ctx > 0 ? n_ctx : 4096;
 
     g_ctx = llama_init_from_model(g_model, cparams);
-    if (!g_ctx) { llama_model_free(g_model); g_model = nullptr; return -2; }
+    if (!g_ctx) {
+        llama_model_free(g_model);
+        g_model = nullptr;
+        llama_backend_free();
+        g_backend_initialized = false;
+        return -2;
+    }
     return 0;
 }
 
 void LLMTC_CALL llmtc_free(void) {
+    // 実行中の非同期生成があれば、完了を待たずにキャンセルしてから解放する。
+    // (v0.7.3では生成が終わるまで無期限にブロックしていた。
+    //  生成が行われていない場合はキャンセルフラグを立てても何も起きないので無害)
+    g_cancel_flag.store(true);
     if (g_worker_thread.joinable()) g_worker_thread.join();
     if (g_ctx)   { llama_free(g_ctx);        g_ctx = nullptr; }
     if (g_model) { llama_model_free(g_model); g_model = nullptr; }
-    llama_backend_free();
+    if (g_backend_initialized) {
+        llama_backend_free();
+        g_backend_initialized = false;
+    }
     g_reply_buffer.clear();
-    g_async_result.clear();
+    { std::lock_guard<std::mutex> lk(g_result_mutex);  g_async_result.clear(); }
     { std::lock_guard<std::mutex> lk(g_partial_mutex); g_partial_buffer.clear(); }
     { std::lock_guard<std::mutex> lk(g_error_mutex);   g_last_error.clear(); }
     g_status.store(LLMTC_STATUS_IDLE);
@@ -279,18 +356,39 @@ int LLMTC_CALL llmtc_get_n_ctx(void) {
 
 const char* LLMTC_CALL llmtc_generate(const char* system_prompt, const char* user_message,
                                        double temperature, int max_tokens) {
-    if (!do_generate(system_prompt ? system_prompt : "",
-                     user_message  ? user_message  : "",
-                     temperature, max_tokens)) return nullptr;
+    // 非同期生成が実行中、またはDONE/CANCELLEDの結果が未取得の場合はここで失敗させる。
+    // (通常の「同期APIだけを使う」利用では常にIDLEなので、この分岐には入らない)
+    if (!try_start_generation()) {
+        std::lock_guard<std::mutex> lk(g_error_mutex);
+        g_last_error = "llmtc_generate: another generation is already running, "
+                       "or an async result is pending (call llmtc_get_result_to_buffer first)";
+        return nullptr;
+    }
+
+    bool ok = do_generate(system_prompt ? system_prompt : "",
+                          user_message  ? user_message  : "",
+                          temperature, max_tokens);
+    g_status.store(LLMTC_STATUS_IDLE);
+
+    if (!ok) return nullptr;
     return g_reply_buffer.c_str();
 }
 
 int LLMTC_CALL llmtc_generate_to_buffer(const char* system_prompt, const char* user_message,
                                          double temperature, int max_tokens,
                                          char* out_buffer, int buffer_size) {
+    if (!try_start_generation()) {
+        std::lock_guard<std::mutex> lk(g_error_mutex);
+        g_last_error = "llmtc_generate_to_buffer: another generation is already running, "
+                       "or an async result is pending (call llmtc_get_result_to_buffer first)";
+        return copy_to_buffer(nullptr, out_buffer, buffer_size);
+    }
+
     bool ok = do_generate(system_prompt ? system_prompt : "",
                           user_message  ? user_message  : "",
                           temperature, max_tokens);
+    g_status.store(LLMTC_STATUS_IDLE);
+
     if (!ok) return copy_to_buffer(nullptr, out_buffer, buffer_size);
     return copy_to_buffer_encoded(g_reply_buffer, out_buffer, buffer_size);
 }
@@ -299,12 +397,19 @@ int LLMTC_CALL llmtc_generate_to_buffer(const char* system_prompt, const char* u
 
 int LLMTC_CALL llmtc_generate_async(const char* system_prompt, const char* user_message,
                                      double temperature, int max_tokens) {
-    if (g_status.load() == LLMTC_STATUS_BUSY) return -1;
-    if (!g_ctx || !g_model || !user_message)   return -2;
+    // 事前チェック: 通常ケースでは分かりやすいエラーコード(-1 / -4)を返すための下見。
+    const int st = g_status.load();
+    if (st == LLMTC_STATUS_BUSY) return -1;
+    // DONE/CANCELLEDの結果をまだ取り出していない場合も開始できない
+    if (st == LLMTC_STATUS_DONE || st == LLMTC_STATUS_CANCELLED) return -4;
+    if (!g_ctx || !g_model || !user_message) return -2;
+
+    // 実際の開始可否はここでアトミックに確定させる。
+    // 上のチェックとここまでの間に別スレッド(同期APIや他の非同期呼び出し)が
+    // 割り込んでいた場合のみ失敗する(TOCTOUレース対策。通常はまず起こらない)。
+    if (!try_start_generation()) return -1;
 
     if (g_worker_thread.joinable()) g_worker_thread.join();
-
-    g_status.store(LLMTC_STATUS_BUSY);
 
     std::string sp = system_prompt ? system_prompt : "";
     std::string um = user_message;
@@ -345,6 +450,11 @@ int LLMTC_CALL llmtc_get_partial_result_to_buffer(char* out_buffer, int buffer_s
 }
 
 int LLMTC_CALL llmtc_get_result_to_buffer(char* out_buffer, int buffer_size) {
+    // BUSY中は呼べない (状態を破壊しないためのガード)
+    if (g_status.load() == LLMTC_STATUS_BUSY) {
+        if (out_buffer && buffer_size > 0) out_buffer[0] = '\0';
+        return -3;
+    }
     // DONE と CANCELLED どちらでも結果を取り出せる
     std::lock_guard<std::mutex> lk(g_result_mutex);
     int len = copy_to_buffer_encoded(g_async_result, out_buffer, buffer_size);

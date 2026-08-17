@@ -9,16 +9,22 @@
 
 static char* wide_to_utf8(const wchar_t* w) {
     int len = WideCharToMultiByte(CP_UTF8, 0, w, -1, NULL, 0, NULL, NULL);
+    if (len <= 0) return NULL;
     char* buf = (char*)malloc((size_t)len);
+    if (!buf) return NULL;
     WideCharToMultiByte(CP_UTF8, 0, w, -1, buf, len, NULL, NULL);
     return buf;
 }
 static char* utf8_to_sjis(const char* utf8) {
     int wlen = MultiByteToWideChar(CP_UTF8, 0, utf8, -1, NULL, 0);
+    if (wlen <= 0) return NULL;
     wchar_t* ws = (wchar_t*)malloc(sizeof(wchar_t) * (size_t)wlen);
+    if (!ws) return NULL;
     MultiByteToWideChar(CP_UTF8, 0, utf8, -1, ws, wlen);
     int alen = WideCharToMultiByte(CP_ACP, 0, ws, -1, NULL, 0, NULL, NULL);
+    if (alen <= 0) { free(ws); return NULL; }
     char* buf = (char*)malloc((size_t)alen);
+    if (!buf) { free(ws); return NULL; }
     WideCharToMultiByte(CP_ACP, 0, ws, -1, buf, alen, NULL, NULL);
     free(ws);
     return buf;
@@ -75,11 +81,13 @@ static void print_encoded(const char* utf8_str, int encoding) {
 #ifdef _WIN32
     if (encoding == LLMTC_ENCODING_SJIS) {
         char* sjis = utf8_to_sjis(utf8_str);
-        SetConsoleOutputCP(CP_ACP);
-        fputs(sjis, stdout);
-        fflush(stdout);
-        SetConsoleOutputCP(CP_UTF8);
-        free(sjis);
+        if (sjis) {
+            SetConsoleOutputCP(CP_ACP);
+            fputs(sjis, stdout);
+            fflush(stdout);
+            SetConsoleOutputCP(CP_UTF8);
+            free(sjis);
+        }
         return;
     }
 #endif
@@ -95,83 +103,116 @@ int main(int argc, char** argv) {
     int wargc = 0;
     LPWSTR* wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);
     char** uargv = (char**)malloc(sizeof(char*) * (size_t)wargc);
-    for (int i = 0; i < wargc; i++) uargv[i] = wide_to_utf8(wargv[i]);
+    if (!uargv) { LocalFree(wargv); return 1; }
+    for (int i = 0; i < wargc; i++) {
+        uargv[i] = wide_to_utf8(wargv[i]);
+        if (!uargv[i]) {
+            // OOM: 確保済み分を解放して終了
+            for (int j = 0; j < i; j++) free(uargv[j]);
+            free(uargv);
+            LocalFree(wargv);
+            return 1;
+        }
+    }
     LocalFree(wargv);
     argc = wargc;
     argv = uargv;
+    // uargv は main 終了前に解放する。ラムダでは解放できないため、
+    // return の代わりに goto cleanup を使う設計にする。
 #endif
 
-    if (argc < 2) { print_usage(argv[0]); return 1; }
+    int exit_code = 0;
+
+    if (argc < 2) { print_usage(argv[0]); exit_code = 1; goto cleanup; }
 
     if (!strcmp(argv[1], "-v") || !strcmp(argv[1], "--version")) {
-        printf("%s\n", llmtc_version_info()); return 0;
+        printf("%s\n", llmtc_version_info()); goto cleanup;
     }
     if (!strcmp(argv[1], "-h") || !strcmp(argv[1], "--help") || !strcmp(argv[1], "/?")) {
-        print_usage(argv[0]); return 0;
+        print_usage(argv[0]); goto cleanup;
     }
     if (!strcmp(argv[1], "-l") || !strcmp(argv[1], "--load-only")) {
-        if (argc < 3) { fprintf(stderr, "エラー: -l にはモデルパスが必要です\n"); return 1; }
-        return run_load_check(argv[2], (argc >= 4) ? atoi(argv[3]) : 0);
+        if (argc < 3) { fprintf(stderr, "エラー: -l にはモデルパスが必要です\n"); exit_code = 1; goto cleanup; }
+        exit_code = run_load_check(argv[2], (argc >= 4) ? atoi(argv[3]) : 0);
+        goto cleanup;
     }
     if (!strcmp(argv[1], "-i") || !strcmp(argv[1], "--info")) {
-        if (argc < 3) { fprintf(stderr, "エラー: -i にはモデルパスが必要です\n"); return 1; }
-        return run_model_info(argv[2], (argc >= 4) ? atoi(argv[3]) : 0);
+        if (argc < 3) { fprintf(stderr, "エラー: -i にはモデルパスが必要です\n"); exit_code = 1; goto cleanup; }
+        exit_code = run_model_info(argv[2], (argc >= 4) ? atoi(argv[3]) : 0);
+        goto cleanup;
     }
 
-    const char* model_path   = argv[1];
-    const char* question     = (argc >= 3) ? argv[2] : "こんにちは、自己紹介してください。";
-    double temperature       = (argc >= 4) ? atof(argv[3]) : -1.0;
-    int    max_tokens        = (argc >= 5) ? atoi(argv[4]) : -1;
-    int    verbose           = (argc >= 6) ? atoi(argv[5]) : 0;
-    int    encoding          = (argc >= 7) ? atoi(argv[6]) : LLMTC_ENCODING_UTF8;
-    int    stream            = (argc >= 8) ? atoi(argv[7]) : 0;
-    double top_p             = (argc >= 9) ? atof(argv[8]) : -1.0;
-    double repeat_penalty    = (argc >= 10)? atof(argv[9]) : -1.0;
+    {
+        const char* model_path   = argv[1];
+        const char* question     = (argc >= 3) ? argv[2] : "こんにちは、自己紹介してください。";
+        double temperature       = (argc >= 4) ? atof(argv[3]) : -1.0;
+        int    max_tokens        = (argc >= 5) ? atoi(argv[4]) : -1;
+        int    verbose           = (argc >= 6) ? atoi(argv[5]) : 0;
+        int    encoding          = (argc >= 7) ? atoi(argv[6]) : LLMTC_ENCODING_UTF8;
+        int    stream            = (argc >= 8) ? atoi(argv[7]) : 0;
+        double top_p             = (argc >= 9) ? atof(argv[8]) : -1.0;
+        double repeat_penalty    = (argc >= 10)? atof(argv[9]) : -1.0;
 
-    llmtc_set_verbose(verbose);
-    llmtc_set_generation_params(top_p, repeat_penalty, 0);
+        llmtc_set_verbose(verbose);
+        llmtc_set_generation_params(top_p, repeat_penalty, 0);
 
-    int rc = llmtc_init(model_path, 4096, 0);
-    if (rc != 0) {
-        char errbuf[1024];
-        llmtc_get_last_error_to_buffer(errbuf, sizeof(errbuf));
-        fprintf(stderr, "llmtc_init 失敗 (rc=%d): %s\n", rc, errbuf);
-        return 1;
-    }
-
-    if (!stream) {
-        const char* reply = llmtc_generate(
-            "あなたは親切な日本語アシスタントです。",
-            question, temperature, max_tokens);
-        if (!reply) { fprintf(stderr, "応答の取得に失敗しました\n"); llmtc_free(); return 1; }
-        print_encoded(reply, encoding);
-        printf("\n");
-    } else {
-        rc = llmtc_generate_async(
-            "あなたは親切な日本語アシスタントです。",
-            question, temperature, max_tokens);
-        if (rc != 0) { fprintf(stderr, "generate_async 失敗 (rc=%d)\n", rc); llmtc_free(); return 1; }
-
-        char partial[65536] = "";
-        int  prev_len = 0;
-
-        while (llmtc_get_status() == LLMTC_STATUS_BUSY) {
-            llmtc_get_partial_result_to_buffer(partial, sizeof(partial));
-            int cur_len = (int)strlen(partial);
-            if (cur_len > prev_len) {
-                print_encoded(partial + prev_len, encoding);
-                prev_len = cur_len;
-            }
-#ifdef _WIN32
-            Sleep(10);
-#endif
+        int rc = llmtc_init(model_path, 4096, 0);
+        if (rc != 0) {
+            char errbuf[1024];
+            llmtc_get_last_error_to_buffer(errbuf, sizeof(errbuf));
+            fprintf(stderr, "llmtc_init 失敗 (rc=%d): %s\n", rc, errbuf);
+            exit_code = 1; goto cleanup;
         }
-        printf("\n");
 
-        char final_buf[65536];
-        llmtc_get_result_to_buffer(final_buf, sizeof(final_buf));
+        if (!stream) {
+            const char* reply = llmtc_generate(
+                "あなたは親切な日本語アシスタントです。",
+                question, temperature, max_tokens);
+            if (!reply) {
+                fprintf(stderr, "応答の取得に失敗しました\n");
+                llmtc_free(); exit_code = 1; goto cleanup;
+            }
+            print_encoded(reply, encoding);
+            printf("\n");
+        } else {
+            rc = llmtc_generate_async(
+                "あなたは親切な日本語アシスタントです。",
+                question, temperature, max_tokens);
+            if (rc != 0) {
+                fprintf(stderr, "generate_async 失敗 (rc=%d)\n", rc);
+                llmtc_free(); exit_code = 1; goto cleanup;
+            }
+
+            char partial[65536] = "";
+            int  prev_len = 0;
+
+            while (llmtc_get_status() == LLMTC_STATUS_BUSY) {
+                llmtc_get_partial_result_to_buffer(partial, sizeof(partial));
+                int cur_len = (int)strlen(partial);
+                if (cur_len > prev_len) {
+                    print_encoded(partial + prev_len, encoding);
+                    prev_len = cur_len;
+                }
+#ifdef _WIN32
+                Sleep(10);
+#endif
+            }
+            printf("\n");
+
+            char final_buf[65536];
+            llmtc_get_result_to_buffer(final_buf, sizeof(final_buf));
+        }
+
+        llmtc_free();
     }
 
-    llmtc_free();
-    return 0;
+cleanup:
+#ifdef _WIN32
+    // wide_to_utf8 で確保した文字列を解放する
+    if (argv == uargv) {
+        for (int i = 0; i < argc; i++) free(uargv[i]);
+        free(uargv);
+    }
+#endif
+    return exit_code;
 }
