@@ -34,7 +34,7 @@ static char* utf8_to_sjis(const char* utf8) {
 static void print_usage(const char* prog) {
     printf("LLMTextCore CLI\n\n");
     printf("使い方:\n");
-    printf("  %s <model.gguf> [質問文] [temperature] [max_tokens] [verbose] [encoding] [stream] [top_p] [repeat_penalty]\n", prog);
+    printf("  %s <model.gguf> [質問文] [temperature] [max_tokens] [verbose] [encoding] [stream] [top_p] [repeat_penalty] [system_prompt]\n", prog);
     printf("  %s -l <model.gguf> [verbose]   モデルのロード確認のみ行う\n", prog);
     printf("  %s -i <model.gguf> [verbose]   モデル情報を表示して終了\n", prog);
     printf("  %s -v, --version\n", prog);
@@ -46,7 +46,8 @@ static void print_usage(const char* prog) {
     printf("  encoding       0=UTF-8出力 (デフォルト) / 1=Shift-JIS出力\n");
     printf("  stream         0=完了後に一括出力 (デフォルト) / 1=逐次出力\n");
     printf("  top_p          0以下または省略でデフォルト値 (0.95) / 1.0で無効化\n");
-    printf("  repeat_penalty 0以下または省略でデフォルト値 (1.0=無効) / 例: 1.1\n\n");
+    printf("  repeat_penalty 0以下または省略でデフォルト値 (1.0=無効) / 例: 1.1\n");
+    printf("  system_prompt  省略時はデフォルト (\"あなたは親切な日本語アシスタントです。\")\n\n");
     printf("通常実行時、標準出力にはAIの応答のみが出力されます。\n");
     printf("エラーメッセージは標準エラー出力に出ます。\n");
 }
@@ -152,6 +153,8 @@ int main(int argc, char** argv) {
         int    stream            = (argc >= 8) ? atoi(argv[7]) : 0;
         double top_p             = (argc >= 9) ? atof(argv[8]) : -1.0;
         double repeat_penalty    = (argc >= 10)? atof(argv[9]) : -1.0;
+        const char* system_prompt = (argc >= 11) ? argv[10]
+                                    : "あなたは親切な日本語アシスタントです。";
 
         llmtc_set_verbose(verbose);
         llmtc_set_generation_params(top_p, repeat_penalty, 0);
@@ -166,7 +169,7 @@ int main(int argc, char** argv) {
 
         if (!stream) {
             const char* reply = llmtc_generate(
-                "あなたは親切な日本語アシスタントです。",
+                system_prompt,
                 question, temperature, max_tokens);
             if (!reply) {
                 fprintf(stderr, "応答の取得に失敗しました\n");
@@ -176,7 +179,7 @@ int main(int argc, char** argv) {
             printf("\n");
         } else {
             rc = llmtc_generate_async(
-                "あなたは親切な日本語アシスタントです。",
+                system_prompt,
                 question, temperature, max_tokens);
             if (rc != 0) {
                 fprintf(stderr, "generate_async 失敗 (rc=%d)\n", rc);

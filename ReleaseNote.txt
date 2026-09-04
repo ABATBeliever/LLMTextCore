@@ -3,38 +3,37 @@ LLMTextCore Release Notes
 
 
 ------------------------------------------------------------------------
+v0.7.5
+------------------------------------------------------------------------
+
+- [EXE] システムプロンプトを指定できるようにした。
+
+
+------------------------------------------------------------------------
 v0.7.4
 ------------------------------------------------------------------------
 Bug fixes / Concurrency
 
+- [DLL] 出力の改行コードをCRLFに統一
+
+- [DLL] 利用するllama.cppのバージョンを固定
+
 - [DLL] 同期APIと非同期APIの同時実行によるデータ競合を修正。
-  llmtc_generate / llmtc_generate_to_buffer が非同期生成の状態(g_status)を
-  確認せずに動作していたため、llmtc_generate_async の実行中に同期APIを呼ぶと、
-  g_reply_buffer や g_ctx へ2つのスレッドから同時にアクセスし得た。
-  開始条件の判定とBUSYへの変更をアトミックに行う try_start_generation() を
-  新設し、同期・非同期どちらの入口もこれを通すよう修正した。
+  「開始条件の判定」と「BUSYへの変更」をアトミックに行う try_start_generation() を
+  新設し、同期・非同期どちらの入口もこれを通すようにした。
   非同期生成が実行中、またはDONE/CANCELLEDの結果が未取得の間、同期APIは
   失敗するようになった (llmtc_generate はNULL、llmtc_generate_to_buffer は
   負値を返す)。同期APIのみ、または非同期APIのみを使う通常の利用では
   挙動に変化はない。
 
-- [DLL] llmtc_generate_async のステータス判定に残っていた TOCTOU レースを修正。
-  「状態を読む」→「BUSYに書き込む」の2ステップの間に別スレッドが割り込むと、
-  複数の呼び出しが同時に開始条件を通過し得た。
-  compare_exchange によるCASループ (try_start_generation) に置き換え、
-  判定と変更を1つのアトミック操作にまとめた。返すエラーコード(-1/-2/-4)に
-  変更はない。
+- [DLL] llmtc_generate_async のステータス判定に残っていたTOCTOUレースを修正。
+  compare_exchangeによるCASループに置き換えた。エラーコード(-1/-2/-4)に変更はない。
 
 - [DLL] g_last_error が生成のたびに際限なく蓄積する問題を修正。
-  llmtc_init のときにしかクリアされておらず、セッション中に出たERRORログが
-  次の生成呼び出しの結果と混ざったまま無制限に連結され続けていた。
-  do_generate の先頭で毎回クリアするよう修正し、防衛的にログコールバック側にも
-  サイズ上限(4KB)を追加した。
+  生成呼び出しの先頭で毎回クリアするようにし、防衛的にログ側にもサイズ上限(4KB)を追加した。
 
 - [DLL] llmtc_free が生成完了まで無期限にブロックする問題を修正。
-  BUSY中に呼ぶと max_tokens 分の生成が終わるまで戻らなかった。
-  呼び出し時に内部でキャンセルフラグを立ててから join するよう修正し、
-  実行中の生成があってもすぐに解放処理へ進めるようにした。
+  呼び出し時に内部でキャンセルフラグを立ててから join するようにした。
 
 
 ------------------------------------------------------------------------
@@ -42,57 +41,37 @@ v0.7.3
 ------------------------------------------------------------------------
 Bug fixes / Security
 
-- [DLL] 生成ループのダングリングポインタを修正。
-  ループ内ローカル変数 next_input を参照した batch をループをまたいで
-  使用していたため、イテレーション終了後にポインタが無効になっていた。
-  next_input をループ外に移動することで修正した。
+- [DLL] 生成ループのダングリングポインタを修正 (ループ内ローカル変数をループ外に移動)
 
-- [DLL] llama_chat_apply_template の2回目呼び出し結果を未チェックだった問題を修正。
-  バッファ拡張後の再呼び出しが失敗した場合、負値を std::string に渡して
-  メモリ破壊が起きる可能性があった。
+- [DLL] llama_chat_apply_template の2回目呼び出し結果の未チェックを修正
+  (失敗時に負値がstd::stringへ渡りメモリ破壊が起きる可能性があった)
 
-- [DLL] llmtc_init に model_path の NULL チェックを追加。
-  NULL を渡すと llama.cpp 内部でクラッシュしていたが、エラーコード -1 と
-  エラーメッセージを返すよう修正した。
+- [DLL] llmtc_init に model_path のNULLチェックを追加 (エラーコード-1を返す)
 
-- [DLL] llama_backend_free の二重呼び出しを防止。
-  llmtc_free を2回呼んだ場合に llama_backend_free が重複して呼ばれる問題を
-  g_backend_initialized フラグで管理するよう修正した。
-  llmtc_init の失敗パスでも正しくバックエンドを解放するようになった。
+- [DLL] llama_backend_free の二重呼び出しを g_backend_initialized フラグで防止
 
-- [DLL] llmtc_get_result_to_buffer に BUSY 中の呼び出しガードを追加。
-  生成中に呼ぶとステータスを強制的に IDLE に戻してしまう問題を修正。
-  BUSY 中は -3 を返して状態を変更しないようにした。
+- [DLL] llmtc_get_result_to_buffer にBUSY中の呼び出しガードを追加
+  (ステータスを強制的にIDLEへ戻してしまう問題を修正、BUSY中は-3を返す)
 
-- [DLL] llmtc_generate_async に DONE/CANCELLED 状態のガードを追加。
-  前の生成結果を llmtc_get_result_to_buffer で取り出す前に再度呼んだ場合、
-  前の結果が無言で消えていた。-4 を返して呼び出しを拒否するようにした。
+- [DLL] llmtc_generate_async にDONE/CANCELLED状態のガードを追加
+  (前の結果が無言で消える問題を修正、-4を返す)
 
-- [DLL] llmtc_generate_async のステータスを2回ロードしていた問題を修正。
-  1回のロードで判定するよう変更した。
+- [DLL] llmtc_generate_async のステータス二重ロードを1回に修正
 
-- [DLL] llmtc_free の g_async_result.clear() に g_result_mutex を追加。
-  join 後は安全だが、防衛的にミューテックスを取るよう修正した。
+- [DLL] llmtc_free の g_async_result.clear() に g_result_mutex を追加
 
-- [DLL] n_tokens <= 0 のチェックを追加。
-  トークナイズ結果が空の場合に早期 return するよう修正した。
+- [DLL] n_tokens <= 0 のチェックを追加 (トークナイズ結果が空の場合に早期return)
 
 - [DLL] llama_sampler_init_penalties を正しい5引数シグネチャに修正。
-  (n_vocab, penalty_last_n, penalty_repeat, penalty_freq, penalty_present)
-  n_vocab の取得に llama_vocab_n_tokens を使用するよう修正した。
-  これにより penalty_last_n が実際に機能するようになった。
+  これによりpenalty_last_nが実際に機能するようになった。
 
-- [DLL] ビルド時の C4005 警告 (LLMTEXTCORE_EXPORTS マクロ再定義) を修正。
-  CMakeLists.txt がコンパイルフラグで定義済みのため、
-  llmtextcore.cpp 先頭の #define を削除した。
+- [DLL] ビルド時のC4005警告 (LLMTEXTCORE_EXPORTSマクロ再定義) を修正
 
-- [EXE/CLI] wide_to_utf8 / utf8_to_sjis の malloc 戻り値 NULL チェックを追加。
-  OOM 時に NULL ポインタへ書き込むことでクラッシュする可能性があった。
+- [EXE/CLI] wide_to_utf8 / utf8_to_sjis のmalloc戻り値NULLチェックを追加
 
-- [EXE/CLI] print_encoded の utf8_to_sjis 結果 NULL ガードを追加。
+- [EXE/CLI] print_encoded のutf8_to_sjis結果NULLガードを追加
 
-- [EXE/CLI] argv (uargv) のメモリリークを修正。
-  goto cleanup パターンにより、main 終了前に確実に解放するよう変更した。
+- [EXE/CLI] argv (uargv) のメモリリークを修正 (goto cleanupパターンで確実に解放)
 
 
 ------------------------------------------------------------------------
@@ -101,38 +80,29 @@ v0.7.1
 Bug fixes / Reliability
 
 - [DLL/EXE] 二重初期化ガードを追加。
-  llmtc_free を呼ばずに llmtc_init を再度呼んだ場合、従来はメモリリークが
-  発生していたが、-3 を即座に返して処理を中止するようになった。
+  llmtc_free を呼ばずに llmtc_init を再度呼んだ場合、-3 を返して処理を中止する。
 
 - [DLL] llmtc_get_last_error_to_buffer を追加。
-  llmtc_init の失敗原因を文字列で取得できるようになった。
-  llama.cpp が出力するエラーログと、独自のエラーメッセージを蓄積して返す。
-  llmtc_init を呼ぶたびにリセットされる。
+  llmtc_init の失敗原因を文字列で取得できる。llmtc_init を呼ぶたびにリセットされる。
 
-- [EXE] llmtc_init 失敗時のエラーメッセージに、上記エラー内容を付記するよう改善。
+- [EXE] llmtc_init 失敗時のエラーメッセージに、上記エラー内容を付記
 
 
 ------------------------------------------------------------------------
 v0.7.0
 ------------------------------------------------------------------------
 
-- [DLL] llmtc_cancel を追加。
-  生成中に呼ぶと、次のトークン生成前(数十ms以内)に生成を中断する。
+- [DLL] llmtc_cancel を追加。生成中に呼ぶと、次のトークン生成前(数十ms以内)に中断する。
 
 - [DLL] LLMTC_STATUS_CANCELLED (=3) を追加。
-  キャンセル後のステータスで、llmtc_get_result_to_buffer から
-  途中まで生成されたテキストを取得できる。
-  DONE と同じ手順で結果を取り出せる。
+  キャンセル後のステータスで、DONEと同じ手順で途中結果を取得できる。
 
 - [DLL] llmtc_set_generation_params(top_p, repeat_penalty, penalty_last_n) を追加。
-  Top-p (nucleus sampling) と Repeat penalty を設定できるようになった。
   0以下を渡した引数はデフォルト値を維持する (top_p=0.95, repeat_penalty=1.0)。
-  llmtc_init の前後どちらでも呼べる。
 
-- [DLL] サンプラーチェーンを刷新。
-  penalties → top_p → temperature → dist の順で適用するよう変更。
+- [DLL] サンプラーチェーンを刷新 (penalties → top_p → temperature → distの順で適用)
 
-- [EXE] 引数 8番目に top_p、9番目に repeat_penalty を追加。
+- [EXE] 引数8番目にtop_p、9番目にrepeat_penaltyを追加
 
 
 ------------------------------------------------------------------------
@@ -140,19 +110,15 @@ v0.6.0
 ------------------------------------------------------------------------
 
 - [DLL] llmtc_get_partial_result_to_buffer を追加。
-  非同期生成中 (BUSY) でも呼べる。生成済みのテキストを先頭からの全文で返す。
-  前回呼んだ時との差分を取ることで、ストリーミング表示が実現できる。
+  非同期生成中(BUSY)でも呼べる。前回との差分でストリーミング表示ができる。
 
-- [DLL] llmtc_get_model_info_to_buffer を追加。
-  ロード済みモデルの名前、パラメータ数、コンテキスト長を改行区切りで返す。
+- [DLL] llmtc_get_model_info_to_buffer を追加 (モデル名・パラメータ数・コンテキスト長)
 
-- [DLL] llmtc_get_n_ctx を追加。
-  コンテキスト長をintで返す。
+- [DLL] llmtc_get_n_ctx を追加
 
-- [EXE] -i <model.gguf> オプションを追加。モデル情報を表示して終了する。
+- [EXE] -i <model.gguf> オプションを追加 (モデル情報を表示して終了)
 
-- [EXE] 引数 7番目 (stream) を追加。
-  1を指定するとトークンを生成しながら標準出力に逐次出力する。
+- [EXE] 引数7番目 (stream) を追加。1でトークンを逐次出力する。
 
 
 ------------------------------------------------------------------------
@@ -166,14 +132,11 @@ v0.5.0
 
 - [DLL] llmtc_set_encoding を追加。
   LLMTC_ENCODING_UTF8 (0, デフォルト) と LLMTC_ENCODING_SJIS (1) を選択できる。
-  SJIS を指定すると *_to_buffer 系の出力をUTF-8→CP932に変換して書き込む。
-  入力 (system_prompt, user_message) は常にUTF-8として受け取る。
+  SJIS指定時は *_to_buffer 系の出力のみUTF-8→CP932に変換される (入力は常にUTF-8)。
 
-- [EXE] 引数 6番目 (encoding) を追加。
-  1を指定するとShift-JIS出力になる。pipeexecで読む場合に使用する。
+- [EXE] 引数6番目 (encoding) を追加。1でShift-JIS出力になる。
 
-- [EXE] コンソールのコードページを起動時にUTF-8に固定するよう変更。
-  -h, -v などの出力が文字化けしなくなった。
+- [EXE] コンソールのコードページを起動時にUTF-8に固定 (-h, -v等の文字化けを解消)
 
 
 ------------------------------------------------------------------------

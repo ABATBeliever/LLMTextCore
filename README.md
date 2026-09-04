@@ -23,37 +23,32 @@ llama.cpp をラップして、ローカルLLMのテキスト生成機能をシ�
 ## ビルド
 
 ```powershell
-git clone https://github.com/ggml-org/llama.cpp
 cmake -B build -A x64
 cmake --build build --config Release
 ```
 
-`build\Release\LLMTextCore.dll` と `build\Release\LLMTextCore.exe` が生成されます。  
+`build\Release\LLMTextCore.dll` と `build\Release\LLMTextCore.exe` が生成されます。
 配布物はこの2ファイルと .gguf モデルファイルだけで動作します。
 
 ## CLI の使い方
 
 ```powershell
-# バージョン確認
+# バージョン確認 / ヘルプ
 LLMTextCore.exe -v
-
-# ヘルプ
 LLMTextCore.exe -h
 
-# モデルのロード確認
+# モデルのロード確認・情報表示
 LLMTextCore.exe -l model.gguf
-
-# モデル情報表示
 LLMTextCore.exe -i model.gguf
 
 # 通常実行 (AIの応答のみ標準出力に出力)
 LLMTextCore.exe model.gguf "こんにちは"
 
 # 各引数をすべて指定する場合
-LLMTextCore.exe model.gguf "質問文" temperature max_tokens verbose encoding stream top_p repeat_penalty
+LLMTextCore.exe model.gguf "質問文" temperature max_tokens verbose encoding stream top_p repeat_penalty systemprompt
 ```
 
-| 引数 | 省略時デフォルト | 説明 |
+| 引数 | デフォルト | 説明 |
 |---|---|---|
 | temperature | 0.7 | 生成の温度。0以下で省略扱い |
 | max_tokens | 512 | 1回の応答の最大トークン数。0以下で省略扱い |
@@ -62,8 +57,9 @@ LLMTextCore.exe model.gguf "質問文" temperature max_tokens verbose encoding s
 | stream | 0 | 1でトークンを生成しながら逐次出力 |
 | top_p | 0.95 | Nucleus sampling。0以下で省略扱い、1.0で無効化 |
 | repeat_penalty | 1.0 | 繰り返しペナルティ。0以下で省略扱い、1.0で無効 |
+| systemprompt | あなたは親切な日本語アシスタントです。 | 与えるシステムプロンプトです |
 
-エラーメッセージは標準エラー出力に出ます。標準出力にはAIの応答のみが流れます。
+標準出力にはAIの応答のみ、エラーメッセージは標準エラー出力に出ます。
 
 ## DLL API リファレンス
 
@@ -104,10 +100,14 @@ LLMTextCore.exe model.gguf "質問文" temperature max_tokens verbose encoding s
 | `llmtc_get_partial_result_to_buffer(buf, size)` | 生成中の途中テキストを先頭から全文で返す (ストリーミング用) |
 | `llmtc_get_result_to_buffer(buf, size)` | 生成完了後(DONEまたはCANCELLED)に結果を取得 |
 
+同期APIと非同期APIは排他的です。非同期生成の実行中、またはその結果(DONE/CANCELLED)を
+`llmtc_get_result_to_buffer`で取り出す前は、同期APIの呼び出しは失敗します。
+同期APIだけ、または非同期APIだけを使う通常の利用では影響ありません。
+
 ### 入力エンコーディングについて
 
-`system_prompt`・`user_message`の入力は**常にUTF-8として受け取ります**。  
-`llmtc_set_encoding(LLMTC_ENCODING_SJIS)`を設定しても、入力の変換は行いません。変換されるのは`*_to_buffer`系の**出力バッファのみ**です。
+`system_prompt`・`user_message`の入力は**常にUTF-8として受け取ります**。
+`llmtc_set_encoding(LLMTC_ENCODING_SJIS)`を設定しても入力の変換は行われません。変換されるのは`*_to_buffer`系の**出力バッファのみ**です。
 
 HSP 3.xで日本語プロンプトを渡す場合は、ソースファイルをUTF-8で保存するか、`cnvatos()`等でUTF-8変換してから渡してください。
 
@@ -161,13 +161,12 @@ p1 = cnvatos("あなたは親切なアシスタントです")
 p2 = cnvatos("こんにちは、自己紹介してください")
 rc = llmtc_generate_async(p1, p2, 0.7, 256)
 
-; ポーリング
+; ポーリング (partial には先頭からの全文が入るので、前回との差分で逐次表示できる)
 sdim partial, 8192
 prev = ""
 *loop
     await 200
     dummy = llmtc_get_partial_result_to_buffer(partial, 8192)
-    ; partial が前回より増えていれば差分を処理する
     if partial != prev : prev = partial
     if llmtc_get_status() = LLMTC_STATUS_BUSY : goto *loop
 
@@ -181,18 +180,12 @@ llmtc_free
 
 ### キャンセルについて
 
-`llmtc_cancel`を呼ぶと次のトークン生成前(数十ms以内)に生成が止まります。  
+`llmtc_cancel`を呼ぶと次のトークン生成前(数十ms以内)に生成が止まります。
 キャンセル後のステータスは`LLMTC_STATUS_CANCELLED`になり、`llmtc_get_result_to_buffer`で途中までの結果を取得できます。
-
-### ストリーミング表示について
-
-`llmtc_get_partial_result_to_buffer`は「先頭からの全テキスト」を返します。  
-前回取得したテキストとの差分を取ることで、生成中に文字を逐次表示できます。  
-`objprm`でテキストボックスの内容を更新する方法が実装しやすく見た目も自然です。
 
 ## モデルについて
 
-.gguf形式のモデルファイルが必要です。Hugging Face などから入手できます。  
+.gguf形式のモデルファイルが必要です。Hugging Face などから入手できます。
 小さめのモデル(1〜3B, Q4〜Q6量子化)がCPU推論で扱いやすいサイズです。
 
 モデルファイル自体はライセンスがそれぞれ異なります。利用前に各モデルのライセンスを確認してください。
@@ -201,5 +194,5 @@ llmtc_free
 
 MIT License — 詳細は [LICENSE](LICENSE) を参照してください。
 
-本ソフトウェアはサードパーティのライブラリを静的リンクしています。  
+本ソフトウェアはサードパーティのライブラリを静的リンクしています。
 詳細は [CREDITS](CREDITS) を参照してください。

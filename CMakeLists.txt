@@ -19,12 +19,54 @@ set(LLAMA_BUILD_SERVER OFF CACHE BOOL "" FORCE)
 # (GPUを使いたい場合はこの行を消すか、コマンドラインで -DGGML_CUDA=ON を指定)
 set(GGML_CUDA OFF CACHE BOOL "" FORCE)
 
-# 事前に `git clone https://github.com/ggml-org/llama.cpp` しておくこと
+# ----- llama.cppの取得とバージョン固定 -----
+# 指定コミットに固定する。動作確認済みのハッシュ。
+set(LLAMA_CPP_PIN_COMMIT "4df29be4f")
+
+find_package(Git REQUIRED)
+
+if (NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/llama.cpp/.git")
+    message(STATUS "llama.cpp が見つからないため clone します...")
+    execute_process(
+        COMMAND ${GIT_EXECUTABLE} clone https://github.com/ggml-org/llama.cpp llama.cpp
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        RESULT_VARIABLE LLAMA_CLONE_RESULT
+    )
+    if (NOT LLAMA_CLONE_RESULT EQUAL 0)
+        message(FATAL_ERROR "llama.cpp の clone に失敗しました")
+    endif()
+endif()
+
+# 現在のコミットを確認し、目的のコミットと違えばfetch+checkoutする
+execute_process(
+    COMMAND ${GIT_EXECUTABLE} rev-parse --short HEAD
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/llama.cpp"
+    OUTPUT_VARIABLE LLAMA_CPP_CURRENT_COMMIT
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+
+if (NOT LLAMA_CPP_CURRENT_COMMIT STREQUAL LLAMA_CPP_PIN_COMMIT)
+    message(STATUS "llama.cpp を ${LLAMA_CPP_PIN_COMMIT} に固定します (現在: ${LLAMA_CPP_CURRENT_COMMIT})")
+    execute_process(
+        COMMAND ${GIT_EXECUTABLE} fetch origin ${LLAMA_CPP_PIN_COMMIT}
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/llama.cpp"
+        RESULT_VARIABLE LLAMA_FETCH_RESULT
+    )
+    execute_process(
+        COMMAND ${GIT_EXECUTABLE} checkout ${LLAMA_CPP_PIN_COMMIT}
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/llama.cpp"
+        RESULT_VARIABLE LLAMA_CHECKOUT_RESULT
+    )
+    if (NOT LLAMA_CHECKOUT_RESULT EQUAL 0)
+        message(FATAL_ERROR "llama.cpp の checkout (${LLAMA_CPP_PIN_COMMIT}) に失敗しました")
+    endif()
+endif()
+
 add_subdirectory(llama.cpp)
 
 # ----- バージョン情報の埋め込み -----
 # LLMTextCore自体のバージョン。リリースごとに更新する。
-set(LLMTEXTCORE_VERSION "0.7.4")
+set(LLMTEXTCORE_VERSION "0.7.5")
 
 # llama.cppサブモジュールのコミットハッシュを取得 (失敗時は "unknown")
 find_package(Git QUIET)

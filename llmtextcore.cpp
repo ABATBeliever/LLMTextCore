@@ -15,7 +15,7 @@
 #endif
 
 #ifndef LLMTEXTCORE_VERSION
-#define LLMTEXTCORE_VERSION "0.0.0-dev"
+#define LLMTEXTCORE_VERSION "0.7.5"
 #endif
 #ifndef LLAMA_CPP_COMMIT
 #define LLAMA_CPP_COMMIT "unknown"
@@ -42,9 +42,9 @@ static int    g_encoding       = LLMTC_ENCODING_UTF8;
 static float  g_top_p          = 0.95f;
 static float  g_repeat_penalty = 1.0f;   // 1.0 = 無効
 static int    g_penalty_last_n = 64;
-static bool   g_backend_initialized = false; // llama_backend_init/free の対称呼び出し管理
+static bool   g_backend_initialized = false; // llama_backend_init/free を対で呼ぶための管理フラグ
 
-// エラーメッセージ: llmtc_init のたびにクリアし、ERRORログや独自エラーを追記する
+// 直近のエラーメッセージ。生成系APIやllmtc_initの呼び出しごとにクリアされる。
 static std::mutex  g_error_mutex;
 static std::string g_last_error;
 
@@ -71,14 +71,42 @@ static std::string to_output(const std::string& s) {
 static std::string to_output(const std::string& s) { return s; }
 #endif
 
+// ----- 改行コード変換 (Windows専用ソフトのため、出力は常にCRLFに統一する) -----
+
+#ifdef _WIN32
+// 単独の '\n' (直前が '\r' でないもの) だけを "\r\n" に変換する。
+// 既に "\r\n" の箇所は変化しないので、二重変換 ("\r\r\n") にはならない。
+static std::string lf_to_crlf(const char* src, size_t len) {
+    std::string out;
+    out.reserve(len + len / 8); // 改行が多少あっても再確保が起きにくいよう少し余分に確保
+    for (size_t i = 0; i < len; ++i) {
+        char c = src[i];
+        if (c == '\n' && (i == 0 || src[i - 1] != '\r')) {
+            out.push_back('\r');
+        }
+        out.push_back(c);
+    }
+    return out;
+}
+#endif
+
 // ----- バッファヘルパー -----
 
 static int copy_to_buffer(const char* src, char* out_buffer, int buffer_size) {
     if (!out_buffer || buffer_size <= 0) return -1;
     if (!src) { out_buffer[0] = '\0'; return -2; }
-    size_t len      = strlen(src);
+#ifdef _WIN32
+    // Shift-JISに変換済みの文字列が渡ってきても、0x0A/0x0Dはどちらの1バイト目・2バイト目にも
+    // 出現しない範囲のバイト値なので、ここでLF→CRLF変換をしても文字の区切りを壊さない。
+    std::string converted = lf_to_crlf(src, strlen(src));
+    const char* final_src  = converted.c_str();
+    size_t      len        = converted.size();
+#else
+    const char* final_src = src;
+    size_t      len        = strlen(src);
+#endif
     size_t copy_len = (len < (size_t)(buffer_size - 1)) ? len : (size_t)(buffer_size - 1);
-    memcpy(out_buffer, src, copy_len);
+    memcpy(out_buffer, final_src, copy_len);
     out_buffer[copy_len] = '\0';
     return (int)copy_len;
 }
@@ -92,9 +120,7 @@ static int copy_to_buffer_encoded(const std::string& utf8_src, char* out_buffer,
 static void llmtc_log_callback(ggml_log_level level, const char* text, void* user_data) {
     (void)user_data;
     if (g_verbose || level == GGML_LOG_LEVEL_ERROR) fputs(text, stderr);
-    // ERRORレベルのログはg_last_errorにも蓄積する
-    // (1回の生成中に大量のERRORログが出ても際限なく肥大化しないよう上限を設ける。
-    //  本体は do_generate() の先頭で毎回クリアされるので、通常はここまで溜まらない)
+    // ERRORレベルのログはg_last_errorにも蓄積する(上限4KB)
     if (level == GGML_LOG_LEVEL_ERROR && text) {
         std::lock_guard<std::mutex> lk(g_error_mutex);
         if (g_last_error.size() < 4096) {
@@ -117,9 +143,7 @@ static bool do_generate(const char* system_prompt_utf8, const char* user_message
 
     if (!g_ctx || !g_model || !user_message_utf8) return false;
 
-    // 今回の生成用にエラーバッファをリセットする。
-    // (v0.7.3では llmtc_init のときしかクリアされず、以降の生成で出たERRORログが
-    //  セッション終了まで無制限に蓄積し続けていた)
+    // 今回の生成用にエラーバッファをリセットする
     {
         std::lock_guard<std::mutex> lk(g_error_mutex);
         g_last_error.clear();
@@ -205,20 +229,10 @@ static bool do_generate(const char* system_prompt_utf8, const char* user_message
 
 // ----- 生成の排他制御 -----
 //
-// v0.7.3までは「g_status を読んで判断」→「後で BUSY に書き込む」の2段階になっており、
-// 別スレッドがその間に割り込む TOCTOU レースがあった。加えて、同期API (llmtc_generate系) は
-// この判断を一切行わずに do_generate() を呼んでいたため、非同期生成が実行中に同期APIを
-// 呼んでしまうと、g_reply_buffer やモデル/コンテキスト(g_ctx)へ2つのスレッドから同時に
-// アクセスすることになり、データ競合やクラッシュにつながり得た。
-//
-// v0.7.4では、同期・非同期どちらの入口も必ずこの try_start_generation() を通し、
-// 「開始してよいか判定」と「BUSYへの変更」を compare_exchange で1つのアトミック操作にまとめる。
-// これにより、以下の2つが同時に成立することはなくなる:
-//   ・同期APIの実行中(呼び出しスレッド上でdo_generateが走っている間)に別の生成が始まる
-//   ・非同期APIが2重に起動される
-//
-// 許可される開始元の状態は v0.7.3と同じ (IDLE または ERROR)。BUSY / DONE / CANCELLED からは
-// 開始できない、という外部から見た挙動は変更していない。
+// 同期API・非同期APIの入口は必ずこの try_start_generation() を通す。
+// 「開始してよいか判定」と「BUSYへの変更」を compare_exchange で1つのアトミック操作に
+// まとめることで、複数スレッドが同時に生成を開始してしまう競合を防ぐ。
+// 開始できるのは IDLE または ERROR のときのみ。BUSY / DONE / CANCELLED からは開始できない。
 static bool try_start_generation() {
     int expected = g_status.load();
     for (;;) {
@@ -310,9 +324,8 @@ int LLMTC_CALL llmtc_init(const char* model_path, int n_ctx, int n_gpu_layers) {
 }
 
 void LLMTC_CALL llmtc_free(void) {
-    // 実行中の非同期生成があれば、完了を待たずにキャンセルしてから解放する。
-    // (v0.7.3では生成が終わるまで無期限にブロックしていた。
-    //  生成が行われていない場合はキャンセルフラグを立てても何も起きないので無害)
+    // 実行中の非同期生成があれば、完了を待たずにキャンセルしてから解放する
+    // (生成が行われていない場合はキャンセルフラグを立てても無害)
     g_cancel_flag.store(true);
     if (g_worker_thread.joinable()) g_worker_thread.join();
     if (g_ctx)   { llama_free(g_ctx);        g_ctx = nullptr; }
@@ -356,8 +369,7 @@ int LLMTC_CALL llmtc_get_n_ctx(void) {
 
 const char* LLMTC_CALL llmtc_generate(const char* system_prompt, const char* user_message,
                                        double temperature, int max_tokens) {
-    // 非同期生成が実行中、またはDONE/CANCELLEDの結果が未取得の場合はここで失敗させる。
-    // (通常の「同期APIだけを使う」利用では常にIDLEなので、この分岐には入らない)
+    // 非同期生成が実行中、またはDONE/CANCELLEDの結果が未取得の場合は失敗する
     if (!try_start_generation()) {
         std::lock_guard<std::mutex> lk(g_error_mutex);
         g_last_error = "llmtc_generate: another generation is already running, "
@@ -371,6 +383,11 @@ const char* LLMTC_CALL llmtc_generate(const char* system_prompt, const char* use
     g_status.store(LLMTC_STATUS_IDLE);
 
     if (!ok) return nullptr;
+#ifdef _WIN32
+    // この関数は copy_to_buffer を経由しないので、ここで個別にCRLF化する。
+    // (呼び出し側への契約「次の生成呼び出しまで有効なポインタ」は変わらない)
+    g_reply_buffer = lf_to_crlf(g_reply_buffer.c_str(), g_reply_buffer.size());
+#endif
     return g_reply_buffer.c_str();
 }
 
@@ -397,16 +414,14 @@ int LLMTC_CALL llmtc_generate_to_buffer(const char* system_prompt, const char* u
 
 int LLMTC_CALL llmtc_generate_async(const char* system_prompt, const char* user_message,
                                      double temperature, int max_tokens) {
-    // 事前チェック: 通常ケースでは分かりやすいエラーコード(-1 / -4)を返すための下見。
+    // 事前チェック: 分かりやすいエラーコード(-1 / -4)を返すための下見
     const int st = g_status.load();
     if (st == LLMTC_STATUS_BUSY) return -1;
     // DONE/CANCELLEDの結果をまだ取り出していない場合も開始できない
     if (st == LLMTC_STATUS_DONE || st == LLMTC_STATUS_CANCELLED) return -4;
     if (!g_ctx || !g_model || !user_message) return -2;
 
-    // 実際の開始可否はここでアトミックに確定させる。
-    // 上のチェックとここまでの間に別スレッド(同期APIや他の非同期呼び出し)が
-    // 割り込んでいた場合のみ失敗する(TOCTOUレース対策。通常はまず起こらない)。
+    // 実際の開始可否はここでアトミックに確定させる(他スレッドとの競合対策)
     if (!try_start_generation()) return -1;
 
     if (g_worker_thread.joinable()) g_worker_thread.join();
