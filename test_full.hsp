@@ -1,6 +1,5 @@
 #include "hsp3_64.as"
-; LLMTextCore.dll 動作確認スクリプト (0.7.4)
-; このファイルはUTF-8で保存されています。
+; LLMTextCore.dll 動作確認スクリプト (0.8.0)
 
 out=""
 
@@ -23,6 +22,8 @@ pos 0,0
 #cfunc llmtc_get_partial_result_to_buffer "llmtc_get_partial_result_to_buffer" var, int
 #cfunc llmtc_get_result_to_buffer         "llmtc_get_result_to_buffer"         var, int
 #cfunc llmtc_get_last_error_to_buffer "llmtc_get_last_error_to_buffer" var, int
+#cfunc llmtc_get_api_level_major     "llmtc_get_api_level_major"
+#cfunc llmtc_get_api_level_minor     "llmtc_get_api_level_minor"
 
 #const LLMTC_STATUS_IDLE      0
 #const LLMTC_STATUS_BUSY      1
@@ -39,6 +40,14 @@ out_enc    = LLMTC_ENCODING_UTF8
 sdim verbuf, 256
 dummy = llmtc_version_info_to_buffer(verbuf, 256)
 mes "Version: " + verbuf
+
+api_major = llmtc_get_api_level_major()
+api_minor = llmtc_get_api_level_minor()
+mes "APIレベル: " + api_major + "." + api_minor
+if api_major != 1 {
+	mes "このDLLのAPIレベルには対応していません (要求: メジャー1 / 実際: " + api_major + "." + api_minor + ")"
+	stop
+}
 
 ; --- 設定 ---
 llmtc_set_verbose 0

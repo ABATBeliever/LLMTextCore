@@ -1,0 +1,123 @@
+#include "hsp3_64.as"
+; LLMTextCore.dll 動作確認スクリプト (0.7.4)
+; このファイルはUTF-8で保存されています。
+
+out=""
+
+pos 0,160:objsize 640,200:mesbox out
+pos 540,0:objsize 100, 20:button "Stop",*gen_stop
+pos 0,0
+
+#uselib "LLMTextCore.dll"
+#cfunc llmtc_version_info_to_buffer       "llmtc_version_info_to_buffer"       var, int
+#func  llmtc_set_verbose                  "llmtc_set_verbose"                  int
+#func  llmtc_set_encoding                 "llmtc_set_encoding"                 int
+#cfunc llmtc_set_generation_params        "llmtc_set_generation_params"        double, double, int
+#cfunc llmtc_init                         "llmtc_init"                         str, int, int
+#func  llmtc_free                         "llmtc_free"
+#cfunc llmtc_get_model_info_to_buffer     "llmtc_get_model_info_to_buffer"     var, int
+#cfunc llmtc_get_n_ctx                    "llmtc_get_n_ctx"
+#cfunc llmtc_generate_async               "llmtc_generate_async"               str, str, double, int
+#func  llmtc_cancel                       "llmtc_cancel"
+#cfunc llmtc_get_status                   "llmtc_get_status"
+#cfunc llmtc_get_partial_result_to_buffer "llmtc_get_partial_result_to_buffer" var, int
+#cfunc llmtc_get_result_to_buffer         "llmtc_get_result_to_buffer"         var, int
+#cfunc llmtc_get_last_error_to_buffer "llmtc_get_last_error_to_buffer" var, int
+#cfunc llmtc_get_api_level_major     "llmtc_get_api_level_major"
+#cfunc llmtc_get_api_level_minor     "llmtc_get_api_level_minor"
+
+#const LLMTC_STATUS_IDLE      0
+#const LLMTC_STATUS_BUSY      1
+#const LLMTC_STATUS_DONE      2
+#const LLMTC_STATUS_CANCELLED 3
+#const LLMTC_STATUS_ERROR    -1
+#const LLMTC_ENCODING_UTF8    0
+#const LLMTC_ENCODING_SJIS    1
+
+model_path = "C:/Users/abatb/Documents/models/Qwen3-1.7B-Q6_K.gguf"
+out_enc    = LLMTC_ENCODING_UTF8
+
+; --- バージョン ---
+sdim verbuf, 256
+dummy = llmtc_version_info_to_buffer(verbuf, 256)
+mes "Version: " + verbuf
+
+api_major = llmtc_get_api_level_major()
+api_minor = llmtc_get_api_level_minor()
+mes "APIレベル: " + api_major + "." + api_minor
+if api_major != 1 {
+	mes "このDLLのAPIレベルには対応していません (要求: メジャー1 / 実際: " + api_major + "." + api_minor + ")"
+	stop
+}
+
+; --- 設定 ---
+llmtc_set_verbose 0
+llmtc_set_encoding out_enc
+
+; top_p=0.95, repeat_penalty=1.1 (少し繰り返し抑制), penalty_last_n=デフォルト(0)
+dummy = llmtc_set_generation_params(0.95, 1.1, 0)
+
+; --- モデルロード ---
+mes "Loading..."
+redraw 1 : await 10
+
+rc = llmtc_init(model_path, 4096, 0)
+if rc != 0 {
+    sdim errbuf, 1024
+    dummy = llmtc_get_last_error_to_buffer(errbuf, 1024)
+    mes "init failed rc=" + rc + ": " + errbuf
+    stop
+}
+
+; --- モデル情報 ---
+sdim infobuf, 512
+dummy = llmtc_get_model_info_to_buffer(infobuf, 512)
+mes "---- Model Info ----"
+mes infobuf
+mes "--------------------"
+
+; --- ストリーミング生成 (キャンセル対応) ---
+mes "Generating..."
+p1="あなたは誠実なAIアシスタントです"
+p2="こんにちは、自己紹介をお願いします /nothink"
+rc = llmtc_generate_async(cnvatos(p1), cnvatos(p2), 0.7, 256)
+if rc != 0 { mes "async failed: rc=" + rc : stop }
+
+sdim partial, 8192
+prev = ""
+
+; ---- ポーリングループ ----
+; キャンセルしたい場合は別途ボタン等から llmtc_cancel を呼ぶ
+*stream_loop
+    await 500
+    dummy = llmtc_get_partial_result_to_buffer(partial, 8192)
+    if partial != prev {
+        delta = strmid(partial, strlen(prev), strlen(partial) - strlen(prev))
+        out+="\n"+delta
+        objprm 0,out
+        prev = partial
+    }
+    status = llmtc_get_status()
+    if status = LLMTC_STATUS_BUSY : goto *stream_loop
+
+; --- 結果取得 (DONE / CANCELLED どちらでも同じ手順) ---
+sdim reply, 8192
+dummy = llmtc_get_result_to_buffer(reply, 8192)
+
+if status = LLMTC_STATUS_CANCELLED {
+    mes "---- キャンセルされました (途中結果) ----"
+} else:if status = LLMTC_STATUS_ERROR {
+    mes "---- エラーが発生しました ----"
+} else {
+    mes "---- 生成完了 ----"
+    objprm 0,reply
+}
+
+llmtc_free
+mes "Done"
+stop
+
+*gen_stop
+	llmtc_cancel
+	llmtc_free
+	stop

@@ -33,16 +33,31 @@ static std::mutex  g_result_mutex;
 static std::string g_async_result;    // 最終結果 (DONE/CANCELLED どちらでも有効)
 
 static std::mutex  g_partial_mutex;
-static std::string g_partial_buffer;  // 途中テキスト (累積)
+static std::string g_partial_buffer;           // 途中テキスト (本文、タグ分離後。累積)
+static std::string g_partial_thinking_buffer;   // 途中テキスト (思考部分、タグ分離後。累積)
 
-static std::string g_reply_buffer;    // do_generate 内作業用
+static std::string g_reply_buffer;    // do_generate 内作業用 (本文)
+static std::string g_raw_buffer;      // do_generate 内作業用 (タグ分離前の生テキスト。THINK_MODE_TAG時のみ使用)
 
-static int    g_verbose        = 0;
-static int    g_encoding       = LLMTC_ENCODING_UTF8;
+static std::atomic<int> g_verbose{0};
+static std::atomic<int> g_encoding{LLMTC_ENCODING_UTF8};
 static float  g_top_p          = 0.95f;
 static float  g_repeat_penalty = 1.0f;   // 1.0 = 無効
 static int    g_penalty_last_n = 64;
 static bool   g_backend_initialized = false; // llama_backend_init/free を対で呼ぶための管理フラグ
+
+// ----- 思考(thinking)分離設定 -----
+static int         g_think_mode  = LLMTC_THINK_MODE_NONE;
+static std::string g_think_start = "<think>";   // Qwen3系のデフォルト
+static std::string g_think_end   = "</think>";  // Qwen3系のデフォルト
+
+// g_think_mode / g_think_start / g_think_end / g_top_p / g_repeat_penalty / g_penalty_last_n を保護する。
+// これらは llmtc_set_think_mode / llmtc_set_generation_params (任意のスレッドから呼ばれ得る) と、
+// 生成ワーカースレッド側の do_generate の両方からアクセスされるため、
+// 素のグローバル変数のままだとデータレースになる (特に std::string の g_think_start/end は
+// 生成中に書き換えられるとクラッシュしうる)。do_generate は生成開始時に一度だけこのロックを
+// 取ってローカルにスナップショットし、以降はそのコピーだけを使う。
+static std::mutex g_config_mutex;
 
 // 直近のエラーメッセージ。生成系APIやllmtc_initの呼び出しごとにクリアされる。
 static std::mutex  g_error_mutex;
@@ -115,6 +130,47 @@ static int copy_to_buffer_encoded(const std::string& utf8_src, char* out_buffer,
     return copy_to_buffer(to_output(utf8_src).c_str(), out_buffer, buffer_size);
 }
 
+// ----- 思考(thinking)分離 -----
+//
+// raw (タグ分離前の生テキスト全文) を毎トークンごとに先頭から再走査し、
+// start_tag ~ end_tag の区間を thinking、それ以外を body に振り分ける。
+// トークン単位でO(n)の再走査になるが、ローカルツール用途の出力量(数千トークン程度)
+// では問題にならないため、タグがトークン境界をまたいでも確実に検出できる
+// このシンプルな実装を採用している。
+// think_mode/start_tag/end_tag はグローバルを直接読まず引数で受け取る
+// (呼び出し元の do_generate が生成開始時に一度だけスナップショットした値を渡す)。
+static void split_thinking(const std::string& raw, int think_mode,
+                            const std::string& start_tag, const std::string& end_tag,
+                            std::string& body, std::string& thinking) {
+    body.clear();
+    thinking.clear();
+    if (think_mode != LLMTC_THINK_MODE_TAG || start_tag.empty()) {
+        body = raw;
+        return;
+    }
+    size_t start_pos = raw.find(start_tag);
+    if (start_pos == std::string::npos) {
+        // 開始タグがまだ出現していない場合、そこまでの内容はすべて本文として扱う
+        body = raw;
+        return;
+    }
+    // 開始タグより前のテキスト (通常は空だが、モデルによっては前置きが出ることもある)
+    body = raw.substr(0, start_pos);
+
+    size_t think_content_start = start_pos + start_tag.size();
+    size_t end_pos = end_tag.empty()
+        ? std::string::npos
+        : raw.find(end_tag, think_content_start);
+
+    if (end_pos == std::string::npos) {
+        // 終了タグがまだ出現していない = 思考が生成中。残り全部を思考として扱う。
+        thinking = raw.substr(think_content_start);
+    } else {
+        thinking = raw.substr(think_content_start, end_pos - think_content_start);
+        body    += raw.substr(end_pos + end_tag.size());
+    }
+}
+
 // ----- ログ -----
 
 static void llmtc_log_callback(ggml_log_level level, const char* text, void* user_data) {
@@ -136,9 +192,11 @@ static bool do_generate(const char* system_prompt_utf8, const char* user_message
     // 開始時にキャンセルフラグをリセット
     g_cancel_flag.store(false);
     g_reply_buffer.clear();
+    g_raw_buffer.clear();
     {
         std::lock_guard<std::mutex> lk(g_partial_mutex);
         g_partial_buffer.clear();
+        g_partial_thinking_buffer.clear();
     }
 
     if (!g_ctx || !g_model || !user_message_utf8) return false;
@@ -151,6 +209,25 @@ static bool do_generate(const char* system_prompt_utf8, const char* user_message
 
     float temp     = (temperature > 0.0) ? (float)temperature : 0.7f;
     int   max_tok  = (max_tokens  > 0)   ? max_tokens         : 512;
+
+    // 生成中に他スレッドから llmtc_set_think_mode / llmtc_set_generation_params が
+    // 呼ばれても、今回の生成には影響しないようにローカルへスナップショットする
+    // (ドキュメント上「次の生成呼び出しから反映される」としている契約を守るため、
+    //  かつ g_think_start/end への読み書き競合によるクラッシュを避けるため)。
+    int         think_mode;
+    std::string think_start, think_end;
+    float       top_p;
+    float       repeat_penalty;
+    int         penalty_last_n;
+    {
+        std::lock_guard<std::mutex> lk(g_config_mutex);
+        think_mode     = g_think_mode;
+        think_start    = g_think_start;
+        think_end      = g_think_end;
+        top_p          = g_top_p;
+        repeat_penalty = g_repeat_penalty;
+        penalty_last_n = g_penalty_last_n;
+    }
 
     std::vector<llama_chat_message> msgs;
     if (system_prompt_utf8 && system_prompt_utf8[0] != '\0')
@@ -187,8 +264,8 @@ static bool do_generate(const char* system_prompt_utf8, const char* user_message
     const int32_t n_vocab = llama_vocab_n_tokens(vocab); // vocab は llama_model_get_vocab(g_model) 取得済み
     llama_sampler* sampler = llama_sampler_chain_init(llama_sampler_chain_default_params());
     llama_sampler_chain_add(sampler,
-        llama_sampler_init_penalties(n_vocab, g_penalty_last_n, g_repeat_penalty, 0.0f, 0.0f));
-    llama_sampler_chain_add(sampler, llama_sampler_init_top_p(g_top_p, 1));
+        llama_sampler_init_penalties(n_vocab, penalty_last_n, repeat_penalty, 0.0f, 0.0f));
+    llama_sampler_chain_add(sampler, llama_sampler_init_top_p(top_p, 1));
     llama_sampler_chain_add(sampler, llama_sampler_init_temp(temp));
     llama_sampler_chain_add(sampler, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
 
@@ -212,9 +289,20 @@ static bool do_generate(const char* system_prompt_utf8, const char* user_message
         char piece[256];
         int len = llama_token_to_piece(vocab, new_token, piece, sizeof(piece), 0, true);
         if (len > 0) {
-            g_reply_buffer.append(piece, len);
-            std::lock_guard<std::mutex> lk(g_partial_mutex);
-            g_partial_buffer.append(piece, len);
+            if (think_mode == LLMTC_THINK_MODE_TAG) {
+                // タグ分離が有効な場合のみ、生テキストを保持して毎トークン再走査する。
+                g_raw_buffer.append(piece, len);
+                std::string thinking;
+                split_thinking(g_raw_buffer, think_mode, think_start, think_end, g_reply_buffer, thinking);
+                std::lock_guard<std::mutex> lk(g_partial_mutex);
+                g_partial_buffer = g_reply_buffer;
+                g_partial_thinking_buffer = thinking;
+            } else {
+                // 従来通りの高速パス (分離なし)
+                g_reply_buffer.append(piece, len);
+                std::lock_guard<std::mutex> lk(g_partial_mutex);
+                g_partial_buffer.append(piece, len);
+            }
         }
 
         next_input = new_token;
@@ -261,17 +349,33 @@ int LLMTC_CALL llmtc_version_info_to_buffer(char* out_buffer, int buffer_size) {
     return copy_to_buffer(llmtc_version_info(), out_buffer, buffer_size);
 }
 
+int LLMTC_CALL llmtc_get_api_level_major(void) { return LLMTC_API_LEVEL_MAJOR; }
+int LLMTC_CALL llmtc_get_api_level_minor(void) { return LLMTC_API_LEVEL_MINOR; }
+
 void LLMTC_CALL llmtc_set_verbose(int enable)  { g_verbose  = enable ? 1 : 0; }
 void LLMTC_CALL llmtc_set_encoding(int mode)   {
     g_encoding = (mode == LLMTC_ENCODING_SJIS) ? LLMTC_ENCODING_SJIS : LLMTC_ENCODING_UTF8;
 }
 
 int LLMTC_CALL llmtc_set_generation_params(double top_p, double repeat_penalty, int penalty_last_n) {
+    std::lock_guard<std::mutex> lk(g_config_mutex);
     if (top_p          > 0.0) g_top_p          = (float)top_p;
     if (repeat_penalty > 0.0) g_repeat_penalty  = (float)repeat_penalty;
     if (penalty_last_n > 0)        g_penalty_last_n = penalty_last_n;
     else if (penalty_last_n == -1) g_penalty_last_n = -1; // コンテキスト全体
     return 0;
+}
+
+void LLMTC_CALL llmtc_set_think_mode(int mode, const char* start_tag, const char* end_tag) {
+    std::lock_guard<std::mutex> lk(g_config_mutex);
+    g_think_mode = (mode == LLMTC_THINK_MODE_TAG) ? LLMTC_THINK_MODE_TAG : LLMTC_THINK_MODE_NONE;
+    if (start_tag && start_tag[0] != '\0') g_think_start = start_tag;
+    if (end_tag   && end_tag[0]   != '\0') g_think_end   = end_tag;
+}
+
+int LLMTC_CALL llmtc_get_thinking_to_buffer(char* out_buffer, int buffer_size) {
+    std::lock_guard<std::mutex> lk(g_partial_mutex);
+    return copy_to_buffer_encoded(g_partial_thinking_buffer, out_buffer, buffer_size);
 }
 
 int LLMTC_CALL llmtc_init(const char* model_path, int n_ctx, int n_gpu_layers) {
@@ -335,8 +439,9 @@ void LLMTC_CALL llmtc_free(void) {
         g_backend_initialized = false;
     }
     g_reply_buffer.clear();
+    g_raw_buffer.clear();
     { std::lock_guard<std::mutex> lk(g_result_mutex);  g_async_result.clear(); }
-    { std::lock_guard<std::mutex> lk(g_partial_mutex); g_partial_buffer.clear(); }
+    { std::lock_guard<std::mutex> lk(g_partial_mutex); g_partial_buffer.clear(); g_partial_thinking_buffer.clear(); }
     { std::lock_guard<std::mutex> lk(g_error_mutex);   g_last_error.clear(); }
     g_status.store(LLMTC_STATUS_IDLE);
     g_cancel_flag.store(false);

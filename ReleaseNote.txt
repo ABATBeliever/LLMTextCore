@@ -3,6 +3,76 @@ LLMTextCore Release Notes
 
 
 ------------------------------------------------------------------------
+v0.8.0
+------------------------------------------------------------------------
+Breaking changes / New feature
+
+- [EXE] CLIの引数書式を全面刷新。v0.7.x までの「N番目の引数は○○」という位置引数方式
+  (<model.gguf> [質問文] [temperature] [max_tokens] [verbose] [encoding] [stream]
+  [top_p] [repeat_penalty] [system_prompt]) を廃止し、--model / --prompt / --temp
+  などのフラグ形式に変更した。引数の追加のたびに文法が複雑化する問題を解消するため、
+  互換性を切り捨てての対応とした。詳細は readme.md および --help を参照。
+  ※ 旧バージョンのコマンドラインをそのまま使っているスクリプトは書き換えが必要になる。
+
+- [EXE] -l / -i がそれぞれ独立した位置引数でモデルパスを取っていたのをやめ、
+  他のモードと同様に --model で指定する形に統一。
+
+- [DLL] APIレベル (llmtc_get_api_level_major / llmtc_get_api_level_minor) を追加。
+  LLMTEXTCORE_VERSION (製品バージョン) とは別に、呼び出し側の互換性判定用として
+  <major>.<minor> の数値を用意した (Androidの API Level と同じ考え方)。major は
+  破壊的変更、minor は後方互換な関数追加のたびに上げる。内部リファクタリングのみの
+  更新では上がらないため、異なる LLMTEXTCORE_VERSION が同じAPIレベルを共有しうる。
+  現在のAPIレベルは 1.0。CLIからは --api-level で確認できる。
+
+- [DLL] 思考(thinking/reasoning)分離機能を追加。
+    llmtc_set_think_mode(mode, start_tag, end_tag)
+    llmtc_get_thinking_to_buffer(buf, size)
+  モデルが本文の前に出力する思考過程を、開始/終了タグ指定で本文から分離できるように
+  なった。従来はQwen3系の "<think></think>" 決め打ちでアプリ側が個別対応する必要が
+  あったが、タグを外部から指定できるようにすることで、GPT-OSS系などタグ体系が異なる
+  モデルにも(タグさえ分かれば)対応できるようにした。デフォルトは分離無効
+  (LLMTC_THINK_MODE_NONE) で、既存の呼び出し側の動作に影響はない。
+  llmtc_generate / llmtc_generate_to_buffer / llmtc_get_result_to_buffer /
+  llmtc_get_partial_result_to_buffer は、分離が有効な場合は思考区間を除いた本文のみを
+  返すようになる (エクスポート関数の追加のみで、既存関数のシグネチャに変更はない)。
+
+- [EXE] 上記に伴い --think-cut / --think-start / --think-end / --show-thinking を追加。
+  --think-cut は --stream と同様、値を取らない単純なフラグ (指定すれば有効、既定は無効)。
+  タグは --think-start / --think-end で個別指定でき、省略時は "<think>" / "</think>" になる。
+  --show-thinking 指定時も標準出力には常に本文のみが出力され、思考内容は標準エラー
+  出力に分離される (pipeexec等でのパイプ運用に影響しないようにするため)。
+
+- [EXE] ストリーミング出力(--stream)で、BUSY状態のポーリング終了直後(BUSY→DONEの
+  遷移の間)に生成された末尾分を取りこぼす可能性があった箇所を修正。ループを抜けた後に
+  もう一度だけ差分取得するようにした。
+
+- [EXE] ストリーミング出力がERROR/CANCELLEDで終わった場合に、原因をより分かりやすく
+  標準エラー出力に表示するようにした。
+
+- [DLL] 内部的に「生成中の生テキスト」と「タグ分離後の本文」を分けて保持するように
+  リファクタリング (思考分離が無効な場合は従来通りの経路で動作し、性能への影響はない)。
+
+- [DLL][バグ修正] g_think_mode / g_think_start / g_think_end / g_top_p / g_repeat_penalty /
+  g_penalty_last_n が、生成ワーカースレッドと llmtc_set_think_mode / llmtc_set_generation_params
+  (別スレッドから呼ばれ得る) との間で無防備なデータレースになっていた問題を修正。特に
+  std::string である g_think_start/end は、生成中に書き換えられるとクラッシュしうる実害の
+  あるバグだった。専用ミューテックス(g_config_mutex)で保護し、do_generate は生成開始時に
+  一度だけ値をローカルへスナップショットして使うように変更 (ThreadSanitizerで修正前は
+  再現、修正後は再現しないことを確認済み)。これに伴い g_verbose / g_encoding も
+  std::atomic<int> 化した。
+
+- [EXE][バグ修正] Windows版で CommandLineToArgvW が失敗した場合に、戻り値のNULLチェックを
+  していなかったため、その後の wargc の不定値使用やNULLポインタ参照に繋がりうる箇所を修正。
+
+- [EXE] --help の内容を簡潔化 (冗長な実行例を削除し、GNUスタイルの一覧形式に変更)。
+
+- [方針] 動作環境の広さを最優先するため、GPUオフロードには対応しない方針を明文化。
+  CLIに --n-gpu-layers 等のGPU関連オプションは設けず、常にCPU推論で動作する。
+  (DLL側の llmtc_init の n_gpu_layers 引数自体は既存のまま残しているが、
+  CLIからは常に0を渡す。CMakeLists.txt も GGML_CUDA OFF を維持する)
+
+
+------------------------------------------------------------------------
 v0.7.5
 ------------------------------------------------------------------------
 

@@ -2,9 +2,13 @@ LIBRARY LLMTextCore
 EXPORTS
     llmtc_version_info
     llmtc_version_info_to_buffer
+    llmtc_get_api_level_major
+    llmtc_get_api_level_minor
     llmtc_set_verbose
     llmtc_set_encoding
     llmtc_set_generation_params
+    llmtc_set_think_mode
+    llmtc_get_thinking_to_buffer
     llmtc_init
     llmtc_free
     llmtc_get_last_error_to_buffer
