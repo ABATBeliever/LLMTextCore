@@ -15,7 +15,7 @@
 #endif
 
 #ifndef LLMTEXTCORE_VERSION
-#define LLMTEXTCORE_VERSION "0.7.5"
+#define LLMTEXTCORE_VERSION "0.8.1"
 #endif
 #ifndef LLAMA_CPP_COMMIT
 #define LLAMA_CPP_COMMIT "unknown"

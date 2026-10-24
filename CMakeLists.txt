@@ -16,11 +16,12 @@ set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_SERVER OFF CACHE BOOL "" FORCE)
 
 # CUDA環境が無い場合のビルドエラーを避けるため、明示的にOFFにしておく
+# (GPUを使いたい場合はこの行を消すか、コマンドラインで -DGGML_CUDA=ON を指定)
 set(GGML_CUDA OFF CACHE BOOL "" FORCE)
 
 # ----- llama.cppの取得とバージョン固定 -----
 # 指定コミットに固定する。動作確認済みのハッシュ。
-set(LLAMA_CPP_PIN_COMMIT "790cf51")
+set(LLAMA_CPP_PIN_COMMIT "8e5a58d")
 
 find_package(Git REQUIRED)
 
@@ -65,7 +66,7 @@ add_subdirectory(llama.cpp)
 
 # ----- バージョン情報の埋め込み -----
 # LLMTextCore自体のバージョン。リリースごとに更新する。
-set(LLMTEXTCORE_VERSION "0.8.0")
+set(LLMTEXTCORE_VERSION "0.8.1")
 
 # llama.cppサブモジュールのコミットハッシュを取得 (失敗時は "unknown")
 find_package(Git QUIET)

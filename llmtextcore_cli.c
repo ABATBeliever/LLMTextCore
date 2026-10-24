@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -28,6 +29,27 @@ static char* utf8_to_sjis(const char* utf8) {
     WideCharToMultiByte(CP_ACP, 0, ws, -1, buf, alen, NULL, NULL);
     free(ws);
     return buf;
+}
+
+// "hoge"のようなキー名をWindows仮想キーコード(VK_*)へ変換する。
+// 対応: 英数字1文字 (例: "q", "5")、および ESC/SPACE/TAB/ENTER/F1〜F12。
+// 認識できない場合は0を返す。
+static int stop_key_name_to_vk(const char* name) {
+    if (!name || !name[0]) return 0;
+    if (strlen(name) == 1) {
+        char c = (char)toupper((unsigned char)name[0]);
+        if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) return (int)(unsigned char)c;
+        return 0;
+    }
+    if (!_stricmp(name, "ESC") || !_stricmp(name, "ESCAPE")) return VK_ESCAPE;
+    if (!_stricmp(name, "SPACE"))  return VK_SPACE;
+    if (!_stricmp(name, "TAB"))    return VK_TAB;
+    if (!_stricmp(name, "ENTER"))  return VK_RETURN;
+    if (name[0] == 'F' || name[0] == 'f') {
+        int n = atoi(name + 1);
+        if (n >= 1 && n <= 12) return VK_F1 + (n - 1);
+    }
+    return 0;
 }
 #endif
 
@@ -81,6 +103,10 @@ typedef struct {
     const char* think_start;    // NULLなら既定値 "<think>" を使用
     const char* think_end;      // NULLなら既定値 "</think>" を使用
     int         show_thinking;
+
+    int         strict;         // 0=false(既定) / 1=true: 値の不自然な結合等をエラーにする
+    const char* stop_key;       // NULLなら未指定
+    int         stop_vk;        // stop_key を解決したWindows仮想キーコード (0なら未指定/未解決)
 } Options;
 
 static void options_init_defaults(Options* o) {
@@ -101,16 +127,18 @@ static void options_init_defaults(Options* o) {
     o->think_start     = NULL;
     o->think_end       = NULL;
     o->show_thinking   = 0;
+    o->strict          = 0;
+    o->stop_key        = NULL;
+    o->stop_vk         = 0;
 }
 
 static void print_usage(const char* prog) {
-    printf("LLMTextCore CLI\n\n");
-    printf("使い方:\n %s --model <model.gguf> [オプション]...\n", prog);
-    printf(" %s -v | -h\n\n", prog);
-    printf("引数:\n");
+    printf("使い方: %s --model <model.gguf> [オプション]...\n", prog);
+    printf("       %s -v | -h\n\n", prog);
+    printf("llama.cppベースのローカルLLM推論CLI (常にCPU推論。GPUオフロードは非対応)。\n\n");
     printf("  -m, --model <path>         モデルファイル(.gguf)のパス [必須]\n");
-    printf("  -p, --prompt <text>        ユーザーメッセージ\n");
-    printf("  -s, --system <text>        システムプロンプト\n");
+    printf("  -p, --prompt <text>        ユーザーメッセージ (既定: 汎用の挨拶文)\n");
+    printf("  -s, --system <text>        システムプロンプト (\"\" で無効化)\n");
     printf("      --temp <float>         temperature (既定: 0.7)\n");
     printf("      --max-tokens <int>     最大トークン数 (既定: 512)\n");
     printf("      --n-ctx <int>          コンテキスト長 (既定: 4096)\n");
@@ -120,16 +148,20 @@ static void print_usage(const char* prog) {
     printf("      --stream               トークンを逐次出力する\n");
     printf("      --encoding <enc>       utf8 (既定) | sjis\n");
     printf("      --think-cut            思考(thinking)を本文から分離する (既定: 分離しない)\n");
-    printf("      --think-start <tag>    思考の開始タグ (既定: <think>  / --think-cut 指定時のみ有効)\n");
-    printf("      --think-end <tag>      思考の終了タグ (既定: </think> / --think-cut 指定時のみ有効)\n");
+    printf("      --think-start <tag>    思考の開始タグ (既定: <think> / --think-cut 指定時のみ使用)\n");
+    printf("      --think-end <tag>      思考の終了タグ (既定: </think>)\n");
     printf("      --show-thinking        思考内容を標準エラー出力に表示する\n");
+    printf("      --strict               値の不自然な結合など(例: スペース抜けで次の\n");
+    printf("                             オプション名と連結した値)を検出しエラーにする\n");
+    printf("      --stop-key <key>       指定したキーが押されると生成を中断する (--streamと併用時のみ)\n");
+    printf("                             英数字1文字、またはESC/SPACE/TAB/ENTER/F1〜F12 (Windows限定)\n");
     printf("      --verbose              llama.cppの詳細ログを表示する\n");
     printf("  -l, --load-only            モデルのロード確認のみ行う\n");
     printf("  -i, --info                 モデル情報を表示して終了\n");
     printf("  -v, --version              バージョン情報を表示して終了\n");
     printf("      --api-level            APIレベル (<major>.<minor>) を表示して終了\n");
     printf("  -h, --help                 このヘルプを表示して終了\n\n");
-    printf("標準出力には応答本文のみ出力されます。\nエラーおよびthinking内容は標準エラー出力に出ます。\n");
+    printf("標準出力には応答本文のみ出力されます。エラーおよびthinking内容は標準エラー出力に出ます。\n");
 }
 
 // argv[i] がオプション名 name (または省略形 short_name) に一致するか
@@ -139,19 +171,95 @@ static int is_opt(const char* arg, const char* short_name, const char* long_name
     return 0;
 }
 
+// --strict モードで「値がオプション名そのものに見える」場合の検出に使う既知フラグ一覧。
+// 値が抜けて次のオプション名をそのまま食べてしまったケースを拾うためのもの。
+// 新しいオプションを追加したら、ここにも追記すること。
+static const char* KNOWN_FLAGS[] = {
+    "-h", "--help", "-v", "--version", "--api-level",
+    "-l", "--load-only", "-i", "--info",
+    "-m", "--model", "-p", "--prompt", "-s", "--system",
+    "--temp", "--max-tokens", "--n-ctx",
+    "--top-p", "--repeat-penalty", "--penalty-last-n",
+    "--stream", "--encoding",
+    "--think-cut", "--think-start", "--think-end", "--show-thinking",
+    "--verbose", "--strict", "--stop-key",
+    NULL
+};
+
+static int looks_like_known_flag(const char* s) {
+    for (int i = 0; KNOWN_FLAGS[i]; i++) {
+        if (!strcmp(s, KNOWN_FLAGS[i])) return 1;
+    }
+    return 0;
+}
+
+// argv全体に指定のフラグ(値を取らない単純フラグ)が含まれるかどうかだけを調べる。
+// --strict はどの位置に書かれても効くようにするため、本パースの前に先読みするのに使う。
+static int argv_has_flag(int argc, char** argv, const char* flag) {
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], flag)) return 1;
+    }
+    return 0;
+}
+
 // 値を取る形式のオプション。値が無ければエラーメッセージを出して0を返す。
-static int take_value(int argc, char** argv, int* i, const char** out_value, const char* opt_label) {
+// strict時は、取得した値がそのまま既知のオプション名に一致する場合もエラーにする
+// (スペースの入れ忘れで前のオプションの値と次のオプション名が連結してしまい、
+//  結果として値が丸ごと欠落しているケースを拾うため)。
+static int take_value(int argc, char** argv, int* i, const char** out_value, const char* opt_label, int strict) {
     if (*i + 1 >= argc) {
         fprintf(stderr, "エラー: %s には値の指定が必要です\n", opt_label);
+        return 0;
+    }
+    const char* v = argv[*i + 1];
+    if (strict && looks_like_known_flag(v)) {
+        fprintf(stderr,
+            "エラー(--strict): %s の値が別のオプション名 \"%s\" に見えます。"
+            "値が指定されていない、またはスペースの入れ忘れによる意図しない連結の可能性があります\n",
+            opt_label, v);
         return 0;
     }
     *out_value = argv[++(*i)];
     return 1;
 }
 
+// --strict時、数値オプションの値が末尾まで正しく数値として消費されたかを検証する。
+// atoi/atoiは末尾にゴミがあっても黙って途中まで読んで成功したことにしてしまうため、
+// (例: "64--stream" は atoi で 64 になってしまう) strict時はこれを検出してエラーにする。
+static int parse_int_opt(const char* val, int strict, const char* opt_label, int* out) {
+    if (!strict) { *out = atoi(val); return 1; }
+    char* endptr = NULL;
+    long v = strtol(val, &endptr, 10);
+    if (endptr == val || *endptr != '\0') {
+        fprintf(stderr,
+            "エラー(--strict): %s の値 \"%s\" は不正な整数です"
+            " (末尾に余分な文字がある、意図しない連結の可能性があります)\n", opt_label, val);
+        return 0;
+    }
+    *out = (int)v;
+    return 1;
+}
+static int parse_double_opt(const char* val, int strict, const char* opt_label, double* out) {
+    if (!strict) { *out = atof(val); return 1; }
+    char* endptr = NULL;
+    double v = strtod(val, &endptr);
+    if (endptr == val || *endptr != '\0') {
+        fprintf(stderr,
+            "エラー(--strict): %s の値 \"%s\" は不正な数値です"
+            " (末尾に余分な文字がある、意図しない連結の可能性があります)\n", opt_label, val);
+        return 0;
+    }
+    *out = v;
+    return 1;
+}
+
 // argv を解析して Options に反映する。
 // 戻り値: 0=成功 / 1=即終了してよい(-h/-v等を処理済み) / -1=エラー
 static int parse_args(int argc, char** argv, Options* o) {
+    // --strict はargv中のどこに書かれていても効くようにしたいので、
+    // 本パースの前に先読みしておく (後段のtake_value/数値パースがこれを参照する)。
+    o->strict = argv_has_flag(argc, argv, "--strict");
+
     for (int i = 1; i < argc; i++) {
         const char* a = argv[i];
         const char* val = NULL;
@@ -166,44 +274,44 @@ static int parse_args(int argc, char** argv, Options* o) {
         else if (is_opt(a, "-i", "--info"))       { o->mode = MODE_INFO; }
 
         else if (is_opt(a, "-m", "--model")) {
-            if (!take_value(argc, argv, &i, &val, "--model")) return -1;
+            if (!take_value(argc, argv, &i, &val, "--model", o->strict)) return -1;
             o->model_path = val;
         }
         else if (is_opt(a, "-p", "--prompt")) {
-            if (!take_value(argc, argv, &i, &val, "--prompt")) return -1;
+            if (!take_value(argc, argv, &i, &val, "--prompt", o->strict)) return -1;
             o->prompt = val;
         }
         else if (is_opt(a, "-s", "--system")) {
-            if (!take_value(argc, argv, &i, &val, "--system")) return -1;
+            if (!take_value(argc, argv, &i, &val, "--system", o->strict)) return -1;
             o->system_prompt = val;
         }
         else if (is_opt(a, NULL, "--temp")) {
-            if (!take_value(argc, argv, &i, &val, "--temp")) return -1;
-            o->temperature = atof(val);
+            if (!take_value(argc, argv, &i, &val, "--temp", o->strict)) return -1;
+            if (!parse_double_opt(val, o->strict, "--temp", &o->temperature)) return -1;
         }
         else if (is_opt(a, NULL, "--max-tokens")) {
-            if (!take_value(argc, argv, &i, &val, "--max-tokens")) return -1;
-            o->max_tokens = atoi(val);
+            if (!take_value(argc, argv, &i, &val, "--max-tokens", o->strict)) return -1;
+            if (!parse_int_opt(val, o->strict, "--max-tokens", &o->max_tokens)) return -1;
         }
         else if (is_opt(a, NULL, "--n-ctx")) {
-            if (!take_value(argc, argv, &i, &val, "--n-ctx")) return -1;
-            o->n_ctx = atoi(val);
+            if (!take_value(argc, argv, &i, &val, "--n-ctx", o->strict)) return -1;
+            if (!parse_int_opt(val, o->strict, "--n-ctx", &o->n_ctx)) return -1;
         }
         else if (is_opt(a, NULL, "--top-p")) {
-            if (!take_value(argc, argv, &i, &val, "--top-p")) return -1;
-            o->top_p = atof(val);
+            if (!take_value(argc, argv, &i, &val, "--top-p", o->strict)) return -1;
+            if (!parse_double_opt(val, o->strict, "--top-p", &o->top_p)) return -1;
         }
         else if (is_opt(a, NULL, "--repeat-penalty")) {
-            if (!take_value(argc, argv, &i, &val, "--repeat-penalty")) return -1;
-            o->repeat_penalty = atof(val);
+            if (!take_value(argc, argv, &i, &val, "--repeat-penalty", o->strict)) return -1;
+            if (!parse_double_opt(val, o->strict, "--repeat-penalty", &o->repeat_penalty)) return -1;
         }
         else if (is_opt(a, NULL, "--penalty-last-n")) {
-            if (!take_value(argc, argv, &i, &val, "--penalty-last-n")) return -1;
-            o->penalty_last_n = atoi(val);
+            if (!take_value(argc, argv, &i, &val, "--penalty-last-n", o->strict)) return -1;
+            if (!parse_int_opt(val, o->strict, "--penalty-last-n", &o->penalty_last_n)) return -1;
         }
         else if (is_opt(a, NULL, "--stream")) { o->stream = 1; }
         else if (is_opt(a, NULL, "--encoding")) {
-            if (!take_value(argc, argv, &i, &val, "--encoding")) return -1;
+            if (!take_value(argc, argv, &i, &val, "--encoding", o->strict)) return -1;
             if (!strcmp(val, "sjis")) o->encoding = LLMTC_ENCODING_SJIS;
             else if (!strcmp(val, "utf8")) o->encoding = LLMTC_ENCODING_UTF8;
             else { fprintf(stderr, "エラー: --encoding は utf8 か sjis を指定してください\n"); return -1; }
@@ -212,14 +320,31 @@ static int parse_args(int argc, char** argv, Options* o) {
 
         else if (is_opt(a, NULL, "--think-cut")) { o->think_cut = 1; }
         else if (is_opt(a, NULL, "--think-start")) {
-            if (!take_value(argc, argv, &i, &val, "--think-start")) return -1;
+            if (!take_value(argc, argv, &i, &val, "--think-start", o->strict)) return -1;
             o->think_start = val;
         }
         else if (is_opt(a, NULL, "--think-end")) {
-            if (!take_value(argc, argv, &i, &val, "--think-end")) return -1;
+            if (!take_value(argc, argv, &i, &val, "--think-end", o->strict)) return -1;
             o->think_end  = val;
         }
         else if (is_opt(a, NULL, "--show-thinking")) { o->show_thinking = 1; }
+
+        else if (is_opt(a, NULL, "--strict")) { /* 冒頭で先読み済みなのでここでは何もしない */ }
+        else if (is_opt(a, NULL, "--stop-key")) {
+            if (!take_value(argc, argv, &i, &val, "--stop-key", o->strict)) return -1;
+            o->stop_key = val;
+#ifdef _WIN32
+            o->stop_vk = stop_key_name_to_vk(val);
+            if (o->stop_vk == 0) {
+                fprintf(stderr,
+                    "エラー: --stop-key の値 \"%s\" を認識できません"
+                    " (英数字1文字、またはESC/SPACE/TAB/ENTER/F1〜F12を指定してください)\n", val);
+                return -1;
+            }
+#else
+            fprintf(stderr, "警告: --stop-key はWindows版でのみ有効です (このビルドでは無視されます)\n");
+#endif
+        }
 
         else {
             fprintf(stderr, "エラー: 不明なオプションです: %s\n", a);
@@ -321,6 +446,15 @@ static int run_generate(const Options* o) {
         int  think_footer_shown = 0;
 
         while (llmtc_get_status() == LLMTC_STATUS_BUSY) {
+#ifdef _WIN32
+            // stop-keyが押されていたら、Ctrl+C相当としてキャンセルを要求する。
+            // 実際の中断は llmtc_cancel 側のドキュメント通り、次のトークン生成前
+            // (数十ms以内)に反映される。ここでは要求を出すだけで、後続の処理
+            // (最終状態のCANCELLED判定・出力)は既存のキャンセル処理がそのまま使える。
+            if (o->stop_vk != 0 && (GetAsyncKeyState(o->stop_vk) & 0x8000)) {
+                llmtc_cancel();
+            }
+#endif
             if (o->show_thinking) {
                 flush_thinking_diff(o->encoding, partial_think, sizeof(partial_think), &prev_think_len, &think_header_shown);
             }
@@ -364,7 +498,7 @@ static int run_generate(const Options* o) {
             fprintf(stderr, "生成中にエラーが発生しました: %s\n", errbuf);
             exit_code = 1;
         } else if (final_status == LLMTC_STATUS_CANCELLED) {
-            fprintf(stderr, "(キャンセルされました。途中までの結果を出力しました)\n");
+            fprintf(stderr, "[Canceled]\n");
         }
     }
 
