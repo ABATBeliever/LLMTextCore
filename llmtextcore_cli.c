@@ -4,7 +4,6 @@
 #include <string.h>
 #include <ctype.h>
 
-#ifdef _WIN32
 #include <windows.h>
 #include <shellapi.h>
 
@@ -31,32 +30,61 @@ static char* utf8_to_sjis(const char* utf8) {
     return buf;
 }
 
-// "hoge"のようなキー名をWindows仮想キーコード(VK_*)へ変換する。
-// 対応: 英数字1文字 (例: "q", "5")、および ESC/SPACE/TAB/ENTER/F1〜F12。
-// 認識できない場合は0を返す。
-static int stop_key_name_to_vk(const char* name) {
+// ---- 標準入力監視による中断 (--stop-key) ----
+// --stop-key <key> 指定時、標準入力に指定した文字(キー)が書き込まれたら llmtc_cancel() を呼ぶ。
+// HSPなど親プロセスからパイプ経由で中断要求を送る用途を想定している。
+// 指定キー以外の入力は無視する。標準入力が閉じられただけ(EOF)の場合は中断しない。
+// ReadFileでブロックする専用スレッドで待つのでポーリングは不要。
+// 生成が先に終わった場合はスレッドがブロックしたまま残るが、joinせずプロセス終了で破棄される。
+
+// キー名を、標準入力に届く文字(1バイト)へ変換する。
+// 対応: 英数字1文字 (例: "q", "5"。英字は大文字小文字を区別しない)、およびESC/SPACE/TAB/ENTER。
+// ENTERは '\n' ('\r'も同じ扱い)。認識できない場合は0を返す。
+static int stop_key_name_to_char(const char* name) {
     if (!name || !name[0]) return 0;
     if (strlen(name) == 1) {
-        char c = (char)toupper((unsigned char)name[0]);
-        if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) return (int)(unsigned char)c;
+        unsigned char c = (unsigned char)name[0];
+        if (isalnum(c)) return (int)c;
         return 0;
     }
-    if (!_stricmp(name, "ESC") || !_stricmp(name, "ESCAPE")) return VK_ESCAPE;
-    if (!_stricmp(name, "SPACE"))  return VK_SPACE;
-    if (!_stricmp(name, "TAB"))    return VK_TAB;
-    if (!_stricmp(name, "ENTER"))  return VK_RETURN;
-    if (name[0] == 'F' || name[0] == 'f') {
-        int n = atoi(name + 1);
-        if (n >= 1 && n <= 12) return VK_F1 + (n - 1);
-    }
+    if (!_stricmp(name, "ESC") || !_stricmp(name, "ESCAPE")) return 0x1B;
+    if (!_stricmp(name, "SPACE")) return ' ';
+    if (!_stricmp(name, "TAB"))   return '\t';
+    if (!_stricmp(name, "ENTER")) return '\n';
     return 0;
 }
-#endif
+
+static int stop_key_matches(int stop_char, unsigned char c) {
+    if (stop_char == '\n') return c == '\n' || c == '\r';
+    return toupper(c) == toupper(stop_char);
+}
+
+static DWORD WINAPI stdin_watch_thread(LPVOID param) {
+    int stop_char = (int)(INT_PTR)param;
+    HANDLE h = GetStdHandle(STD_INPUT_HANDLE);
+    char buf[64];
+    DWORD n = 0;
+    while (ReadFile(h, buf, sizeof(buf), &n, NULL) && n > 0) {
+        for (DWORD i = 0; i < n; i++) {
+            if (stop_key_matches(stop_char, (unsigned char)buf[i])) {
+                llmtc_cancel();
+                return 0;
+            }
+        }
+    }
+    return 0; // EOF/エラー: 中断せず終了
+}
+
+static void start_stdin_watch(int stop_char) {
+    HANDLE h = GetStdHandle(STD_INPUT_HANDLE);
+    if (h == NULL || h == INVALID_HANDLE_VALUE) return;
+    HANDLE th = CreateThread(NULL, 0, stdin_watch_thread, (LPVOID)(INT_PTR)stop_char, 0, NULL);
+    if (th) CloseHandle(th);
+}
 
 // ---- 出力ヘルパー ----
 // out_stream には stdout (本文用) か stderr (thinking表示用) を渡す。
 static void print_encoded(const char* utf8_str, int encoding, FILE* out_stream) {
-#ifdef _WIN32
     if (encoding == LLMTC_ENCODING_SJIS) {
         char* sjis = utf8_to_sjis(utf8_str);
         if (sjis) {
@@ -68,7 +96,6 @@ static void print_encoded(const char* utf8_str, int encoding, FILE* out_stream) 
         }
         return;
     }
-#endif
     fputs(utf8_str, out_stream);
     fflush(out_stream);
 }
@@ -105,8 +132,7 @@ typedef struct {
     int         show_thinking;
 
     int         strict;         // 0=false(既定) / 1=true: 値の不自然な結合等をエラーにする
-    const char* stop_key;       // NULLなら未指定
-    int         stop_vk;        // stop_key を解決したWindows仮想キーコード (0なら未指定/未解決)
+    int         stop_char;      // 0=未指定 / それ以外: 標準入力にこの文字が来たら生成を中断する
 } Options;
 
 static void options_init_defaults(Options* o) {
@@ -128,14 +154,16 @@ static void options_init_defaults(Options* o) {
     o->think_end       = NULL;
     o->show_thinking   = 0;
     o->strict          = 0;
-    o->stop_key        = NULL;
-    o->stop_vk         = 0;
+    o->stop_char       = 0;
 }
 
 static void print_usage(const char* prog) {
-    printf("使い方: %s --model <model.gguf> [オプション]...\n", prog);
-    printf("       %s -v | -h\n\n", prog);
-    printf("llama.cppベースのローカルLLM推論CLI (常にCPU推論。GPUオフロードは非対応)。\n\n");
+    (void)prog;
+    printf("LLMTextCore CLI\n\n");
+    printf("使い方:\n");
+    printf(" LLMTextCore --model <model.gguf> [オプション]...\n");
+    printf(" LLMTextCore -v | -h\n\n");
+    printf("引数:\n");
     printf("  -m, --model <path>         モデルファイル(.gguf)のパス [必須]\n");
     printf("  -p, --prompt <text>        ユーザーメッセージ (既定: 汎用の挨拶文)\n");
     printf("  -s, --system <text>        システムプロンプト (\"\" で無効化)\n");
@@ -153,8 +181,8 @@ static void print_usage(const char* prog) {
     printf("      --show-thinking        思考内容を標準エラー出力に表示する\n");
     printf("      --strict               値の不自然な結合など(例: スペース抜けで次の\n");
     printf("                             オプション名と連結した値)を検出しエラーにする\n");
-    printf("      --stop-key <key>       指定したキーが押されると生成を中断する (--streamと併用時のみ)\n");
-    printf("                             英数字1文字、またはESC/SPACE/TAB/ENTER/F1〜F12 (Windows限定)\n");
+    printf("      --stop-key <key>       標準入力に指定したキーが書き込まれると生成を中断する (--streamと併用時のみ)\n");
+    printf("                             英数字1文字、またはESC/SPACE/TAB/ENTER\n");
     printf("      --verbose              llama.cppの詳細ログを表示する\n");
     printf("  -l, --load-only            モデルのロード確認のみ行う\n");
     printf("  -i, --info                 モデル情報を表示して終了\n");
@@ -332,18 +360,13 @@ static int parse_args(int argc, char** argv, Options* o) {
         else if (is_opt(a, NULL, "--strict")) { /* 冒頭で先読み済みなのでここでは何もしない */ }
         else if (is_opt(a, NULL, "--stop-key")) {
             if (!take_value(argc, argv, &i, &val, "--stop-key", o->strict)) return -1;
-            o->stop_key = val;
-#ifdef _WIN32
-            o->stop_vk = stop_key_name_to_vk(val);
-            if (o->stop_vk == 0) {
+            o->stop_char = stop_key_name_to_char(val);
+            if (o->stop_char == 0) {
                 fprintf(stderr,
                     "エラー: --stop-key の値 \"%s\" を認識できません"
-                    " (英数字1文字、またはESC/SPACE/TAB/ENTER/F1〜F12を指定してください)\n", val);
+                    " (英数字1文字、またはESC/SPACE/TAB/ENTERを指定してください)\n", val);
                 return -1;
             }
-#else
-            fprintf(stderr, "警告: --stop-key はWindows版でのみ有効です (このビルドでは無視されます)\n");
-#endif
         }
 
         else {
@@ -438,6 +461,9 @@ static int run_generate(const Options* o) {
             return 1;
         }
 
+        // 非同期生成の開始後に標準入力の監視を始める (do_generate冒頭のフラグリセットと競合しないため)
+        if (o->stop_char != 0) start_stdin_watch(o->stop_char);
+
         char partial[65536]       = "";
         char partial_think[65536] = "";
         int  prev_len       = 0;
@@ -446,15 +472,6 @@ static int run_generate(const Options* o) {
         int  think_footer_shown = 0;
 
         while (llmtc_get_status() == LLMTC_STATUS_BUSY) {
-#ifdef _WIN32
-            // stop-keyが押されていたら、Ctrl+C相当としてキャンセルを要求する。
-            // 実際の中断は llmtc_cancel 側のドキュメント通り、次のトークン生成前
-            // (数十ms以内)に反映される。ここでは要求を出すだけで、後続の処理
-            // (最終状態のCANCELLED判定・出力)は既存のキャンセル処理がそのまま使える。
-            if (o->stop_vk != 0 && (GetAsyncKeyState(o->stop_vk) & 0x8000)) {
-                llmtc_cancel();
-            }
-#endif
             if (o->show_thinking) {
                 flush_thinking_diff(o->encoding, partial_think, sizeof(partial_think), &prev_think_len, &think_header_shown);
             }
@@ -468,9 +485,7 @@ static int run_generate(const Options* o) {
                 print_encoded(partial + prev_len, o->encoding, stdout);
                 prev_len = cur_len;
             }
-#ifdef _WIN32
             Sleep(10);
-#endif
         }
 
         // ループを抜けた直後(最後のポーリングとBUSY→DONE遷移の間)に生成された
@@ -507,7 +522,6 @@ static int run_generate(const Options* o) {
 }
 
 int main(int argc, char** argv) {
-#ifdef _WIN32
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
 
@@ -528,7 +542,6 @@ int main(int argc, char** argv) {
     LocalFree(wargv);
     argc = wargc;
     argv = uargv;
-#endif
 
     int exit_code = 0;
 
@@ -562,11 +575,7 @@ int main(int argc, char** argv) {
     }
 
 cleanup:
-#ifdef _WIN32
-    if (argv == uargv) {
-        for (int i = 0; i < argc; i++) free(uargv[i]);
-        free(uargv);
-    }
-#endif
+    for (int i = 0; i < argc; i++) free(uargv[i]);
+    free(uargv);
     return exit_code;
 }

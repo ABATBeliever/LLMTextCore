@@ -1,17 +1,13 @@
 #ifndef LLMTEXTCORE_H
 #define LLMTEXTCORE_H
 
-#ifdef _WIN32
-  #ifdef LLMTEXTCORE_EXPORTS
-    #define LLMTC_API __declspec(dllexport)
-  #else
-    #define LLMTC_API __declspec(dllimport)
-  #endif
-  #define LLMTC_CALL __stdcall
+// Windows専用
+#ifdef LLMTEXTCORE_EXPORTS
+  #define LLMTC_API __declspec(dllexport)
 #else
-  #define LLMTC_API
-  #define LLMTC_CALL
+  #define LLMTC_API __declspec(dllimport)
 #endif
+#define LLMTC_CALL __stdcall
 
 // llmtc_get_status の戻り値
 #define LLMTC_STATUS_IDLE      0  // 待機中
@@ -38,7 +34,7 @@ LLMTC_API int         LLMTC_CALL llmtc_version_info_to_buffer(char* out_buffer, 
 
 // ---- APIレベル (呼び出し互換性のバージョン) ----
 //
-// LLMTEXTCORE_VERSION (0.8.1 等、ビルドごとの製品バージョン) とは別軸の値。
+// LLMTEXTCORE_VERSION (0.8.2 等、ビルドごとの製品バージョン) とは別軸の値。
 // <major>.<minor> の2つの整数で管理する。対象はDLLのエクスポート関数だけでなく、
 // CLI(LLMTextCore.exe)のオプション体系も含めた、LLMTextCore全体の呼び出し可能な
 // インターフェースとする (例: CLIに新しいオプションを後方互換な形で追加した場合も

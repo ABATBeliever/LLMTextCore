@@ -66,7 +66,7 @@ add_subdirectory(llama.cpp)
 
 # ----- バージョン情報の埋め込み -----
 # LLMTextCore自体のバージョン。リリースごとに更新する。
-set(LLMTEXTCORE_VERSION "0.8.1")
+set(LLMTEXTCORE_VERSION "0.8.2")
 
 # llama.cppサブモジュールのコミットハッシュを取得 (失敗時は "unknown")
 find_package(Git QUIET)
@@ -106,6 +106,4 @@ set_target_properties(llmtextcore_cli PROPERTIES OUTPUT_NAME "LLMTextCore")
 target_link_libraries(llmtextcore_cli PRIVATE llmtextcore)
 target_include_directories(llmtextcore_cli PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
-if (WIN32)
-    target_link_libraries(llmtextcore_cli PRIVATE Shell32)
-endif()
+target_link_libraries(llmtextcore_cli PRIVATE Shell32)

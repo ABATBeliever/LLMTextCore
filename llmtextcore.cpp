@@ -10,12 +10,10 @@
 #include <thread>
 #include <vector>
 
-#ifdef _WIN32
 #include <windows.h>
-#endif
 
 #ifndef LLMTEXTCORE_VERSION
-#define LLMTEXTCORE_VERSION "0.8.1"
+#define LLMTEXTCORE_VERSION "0.8.2"
 #endif
 #ifndef LLAMA_CPP_COMMIT
 #define LLAMA_CPP_COMMIT "unknown"
@@ -65,7 +63,6 @@ static std::string g_last_error;
 
 // ----- エンコーディング変換 -----
 
-#ifdef _WIN32
 static std::string convert_encoding(const std::string& src, UINT from_cp, UINT to_cp) {
     if (src.empty()) return src;
     int wlen = MultiByteToWideChar(from_cp, 0, src.c_str(), -1, nullptr, 0);
@@ -82,13 +79,9 @@ static std::string convert_encoding(const std::string& src, UINT from_cp, UINT t
 static std::string to_output(const std::string& s) {
     return (g_encoding == LLMTC_ENCODING_SJIS) ? convert_encoding(s, CP_UTF8, CP_ACP) : s;
 }
-#else
-static std::string to_output(const std::string& s) { return s; }
-#endif
 
 // ----- 改行コード変換 (Windows専用ソフトのため、出力は常にCRLFに統一する) -----
 
-#ifdef _WIN32
 // 単独の '\n' (直前が '\r' でないもの) だけを "\r\n" に変換する。
 // 既に "\r\n" の箇所は変化しないので、二重変換 ("\r\r\n") にはならない。
 static std::string lf_to_crlf(const char* src, size_t len) {
@@ -103,23 +96,17 @@ static std::string lf_to_crlf(const char* src, size_t len) {
     }
     return out;
 }
-#endif
 
 // ----- バッファヘルパー -----
 
 static int copy_to_buffer(const char* src, char* out_buffer, int buffer_size) {
     if (!out_buffer || buffer_size <= 0) return -1;
     if (!src) { out_buffer[0] = '\0'; return -2; }
-#ifdef _WIN32
     // Shift-JISに変換済みの文字列が渡ってきても、0x0A/0x0Dはどちらの1バイト目・2バイト目にも
     // 出現しない範囲のバイト値なので、ここでLF→CRLF変換をしても文字の区切りを壊さない。
     std::string converted = lf_to_crlf(src, strlen(src));
     const char* final_src  = converted.c_str();
     size_t      len        = converted.size();
-#else
-    const char* final_src = src;
-    size_t      len        = strlen(src);
-#endif
     size_t copy_len = (len < (size_t)(buffer_size - 1)) ? len : (size_t)(buffer_size - 1);
     memcpy(out_buffer, final_src, copy_len);
     out_buffer[copy_len] = '\0';
@@ -189,8 +176,10 @@ static void llmtc_log_callback(ggml_log_level level, const char* text, void* use
 
 static bool do_generate(const char* system_prompt_utf8, const char* user_message_utf8,
                          double temperature, int max_tokens) {
-    // 開始時にキャンセルフラグをリセット
-    g_cancel_flag.store(false);
+    // キャンセルフラグは、ここではリセットしない。
+    // 開始権を取った直後(try_start_generation の直後)に呼び出し側でリセットする。
+    // ここでリセットすると、llmtc_generate_async 直後に届いた llmtc_cancel() が
+    // ワーカースレッドの起動より先に来た場合に、中断要求が消えてしまうため。
     g_reply_buffer.clear();
     g_raw_buffer.clear();
     {
@@ -481,6 +470,7 @@ const char* LLMTC_CALL llmtc_generate(const char* system_prompt, const char* use
                        "or an async result is pending (call llmtc_get_result_to_buffer first)";
         return nullptr;
     }
+    g_cancel_flag.store(false);
 
     bool ok = do_generate(system_prompt ? system_prompt : "",
                           user_message  ? user_message  : "",
@@ -488,11 +478,9 @@ const char* LLMTC_CALL llmtc_generate(const char* system_prompt, const char* use
     g_status.store(LLMTC_STATUS_IDLE);
 
     if (!ok) return nullptr;
-#ifdef _WIN32
     // この関数は copy_to_buffer を経由しないので、ここで個別にCRLF化する。
     // (呼び出し側への契約「次の生成呼び出しまで有効なポインタ」は変わらない)
     g_reply_buffer = lf_to_crlf(g_reply_buffer.c_str(), g_reply_buffer.size());
-#endif
     return g_reply_buffer.c_str();
 }
 
@@ -505,6 +493,7 @@ int LLMTC_CALL llmtc_generate_to_buffer(const char* system_prompt, const char* u
                        "or an async result is pending (call llmtc_get_result_to_buffer first)";
         return copy_to_buffer(nullptr, out_buffer, buffer_size);
     }
+    g_cancel_flag.store(false);
 
     bool ok = do_generate(system_prompt ? system_prompt : "",
                           user_message  ? user_message  : "",
@@ -528,6 +517,7 @@ int LLMTC_CALL llmtc_generate_async(const char* system_prompt, const char* user_
 
     // 実際の開始可否はここでアトミックに確定させる(他スレッドとの競合対策)
     if (!try_start_generation()) return -1;
+    g_cancel_flag.store(false); // ワーカー起動前にリセットする (do_generate側ではリセットしない)
 
     if (g_worker_thread.joinable()) g_worker_thread.join();
 
